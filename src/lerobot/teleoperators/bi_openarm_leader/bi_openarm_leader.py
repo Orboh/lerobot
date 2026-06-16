@@ -52,6 +52,11 @@ class BiOpenArmLeader(Teleoperator):
             use_velocity_and_torque=config.left_arm_config.use_velocity_and_torque,
             position_kd=config.left_arm_config.position_kd,
             position_kp=config.left_arm_config.position_kp,
+            gravity_compensation=config.left_arm_config.gravity_compensation,
+            gravity_urdf_path=config.left_arm_config.gravity_urdf_path,
+            gravity_side="left",
+            gravity_scale=config.left_arm_config.gravity_scale,
+            gravity_vector=config.left_arm_config.gravity_vector,
         )
 
         right_arm_config = OpenArmLeaderConfig(
@@ -67,6 +72,11 @@ class BiOpenArmLeader(Teleoperator):
             use_velocity_and_torque=config.right_arm_config.use_velocity_and_torque,
             position_kd=config.right_arm_config.position_kd,
             position_kp=config.right_arm_config.position_kp,
+            gravity_compensation=config.right_arm_config.gravity_compensation,
+            gravity_urdf_path=config.right_arm_config.gravity_urdf_path,
+            gravity_side="right",
+            gravity_scale=config.right_arm_config.gravity_scale,
+            gravity_vector=config.right_arm_config.gravity_vector,
         )
 
         self.left_arm = OpenArmLeader(left_arm_config)
