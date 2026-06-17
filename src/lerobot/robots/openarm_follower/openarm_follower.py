@@ -274,6 +274,12 @@ class OpenArmFollower(Robot):
         """
 
         goal_pos = {key.removesuffix(".pos"): val for key, val in action.items() if key.endswith(".pos")}
+        # Velocity feed-forward: pass the leader's joint velocity into the MIT `vel`
+        # term so Kd acts as velocity tracking (smooth) rather than pure damping
+        # (which causes stick-slip "buzz"). Matches the official C++ teleop, whose
+        # follower MIT uses the leader velocity. Empty if the teleop doesn't emit
+        # `.vel` (use_velocity_and_torque=False) -> falls back to 0.0 (legacy).
+        goal_vel = {key.removesuffix(".vel"): val for key, val in action.items() if key.endswith(".vel")}
 
         # Apply joint limit clipping to arm
         for motor_name, position in goal_pos.items():
@@ -325,7 +331,14 @@ class OpenArmFollower(Robot):
                     if isinstance(self.config.position_kd, list)
                     else self.config.position_kd
                 )
-            commands[motor_name] = (kp, kd, position_degrees, 0.0, 0.0)
+            vel_ff = goal_vel.get(motor_name)
+            commands[motor_name] = (
+                kp,
+                kd,
+                position_degrees,
+                float(vel_ff) if vel_ff is not None else 0.0,
+                0.0,
+            )
 
         self.bus._mit_control_batch(commands)
 

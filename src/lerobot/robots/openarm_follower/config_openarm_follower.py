@@ -21,24 +21,26 @@ from lerobot.cameras import CameraConfig
 from ..config import RobotConfig
 
 LEFT_DEFAULT_JOINTS_LIMITS: dict[str, tuple[float, float]] = {
-    "joint_1": (-75.0, 75.0),
-    "joint_2": (-90.0, 9.0),
-    "joint_3": (-85.0, 85.0),
-    "joint_4": (0.0, 135.0),
-    "joint_5": (-85.0, 85.0),
-    "joint_6": (-40.0, 40.0),
-    "joint_7": (-80.0, 80.0),
+    # URDF (openarm_v10_bimanual) の物理可動域に合わせた値（度）
+    "joint_1": (-200.0, 80.0),
+    "joint_2": (-190.0, 10.0),
+    "joint_3": (-90.0, 90.0),
+    "joint_4": (0.0, 140.0),
+    "joint_5": (-90.0, 90.0),
+    "joint_6": (-45.0, 45.0),
+    "joint_7": (-90.0, 90.0),
     "gripper": (-65.0, 0.0),
 }
 
 RIGHT_DEFAULT_JOINTS_LIMITS: dict[str, tuple[float, float]] = {
-    "joint_1": (-75.0, 75.0),
-    "joint_2": (-9.0, 90.0),
-    "joint_3": (-85.0, 85.0),
-    "joint_4": (0.0, 135.0),
-    "joint_5": (-85.0, 85.0),
-    "joint_6": (-40.0, 40.0),
-    "joint_7": (-80.0, 80.0),
+    # URDF (openarm_v10_bimanual) の物理可動域に合わせた値（度）。左の符号反転
+    "joint_1": (-80.0, 200.0),
+    "joint_2": (-10.0, 190.0),
+    "joint_3": (-90.0, 90.0),
+    "joint_4": (0.0, 140.0),
+    "joint_5": (-90.0, 90.0),
+    "joint_6": (-45.0, 45.0),
+    "joint_7": (-90.0, 90.0),
     "gripper": (-65.0, 0.0),
 }
 
@@ -102,7 +104,7 @@ class OpenArmFollowerConfigBase:
     position_kp: list[float] = field(
         default_factory=lambda: [240.0, 240.0, 240.0, 240.0, 24.0, 31.0, 25.0, 25.0]
     )
-    position_kd: list[float] = field(default_factory=lambda: [5.0, 5.0, 3.0, 5.0, 0.3, 0.3, 0.3, 0.3])
+    position_kd: list[float] = field(default_factory=lambda: [3.0, 3.0, 3.0, 3.0, 0.2, 0.2, 0.2, 0.2])
 
     # Values for joint limits. Can be overridden via CLI (for custom values) or by setting config.side to either 'left' or 'right'.
     # If config.side is left set to None and no CLI values are passed, the default joint limit values are small for safety.
