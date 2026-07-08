@@ -60,9 +60,46 @@ class OpenArmLeaderConfigBase:
     # When enabled, motors have torque disabled for manual movement
     manual_control: bool = True
 
+    # --- Startup alignment (official AdjustPosition port) ---------------------
+    # On connect, softly interpolate the arm from its current pose to the fixed
+    # initial pose (all joints 0, elbow joint_4 = 36 deg, gripper 0), mirroring
+    # the official openarm_teleop startup so leader and follower start matched.
+    # Needs torque, so it only runs in gravity_compensation or MIT/position
+    # mode; pure manual_control (torque-off) skips it.
+    align_on_connect: bool = True
+    align_duration_s: float = 2.2
+
     # When True, expose `.vel` and `.torque` per motor in action features.
     # Default False for compatibility with the position-only openarm_mini teleoperator.
     use_velocity_and_torque: bool = False
+
+    # --- Gravity compensation -------------------------------------------------
+    # Python/Pinocchio port of the C++ KDL reference
+    # (openarm_teleop/control/gravity_compasation.cpp). When True, the leader runs
+    # with torque ENABLED and injects, every cycle, the gravity feed-forward torque
+    # G(q) so the arm is (near) weightless and can be moved by hand. This takes
+    # precedence over `manual_control` for the torque branch in configure().
+    gravity_compensation: bool = False
+
+    # Path to the dynamics URDF (use the same file the C++ reference uses, e.g.
+    # urdf/openarm_v10_bimanual.urdf). Required when gravity_compensation=True.
+    gravity_urdf_path: str | None = None
+
+    # Which arm this leader drives: "left" or "right". Selects the URDF chain
+    # root=openarm_body_link0 -> leaf=openarm_<side>_hand and joints
+    # openarm_<side>_joint1..7 (matches the C++ chain; gripper fingers excluded).
+    gravity_side: str = "left"
+
+    # Safety scale on the injected torque: tau_cmd = gravity_scale * G(q).
+    # START LOW on real hardware (0.3) and ramp toward 1.0 only after confirming
+    # the measured-q sign and zero match the model (see design note). 1.0 == full
+    # compensation (the C++ uses no scale).
+    gravity_scale: float = 0.3
+
+    # Gravity vector in the chain-root (openarm_body_link0) frame. The C++ uses
+    # (0, 0, -9.81); the root frame is Z-up (verified: world->body_link0 rotation
+    # is identity in the URDF).
+    gravity_vector: tuple[float, float, float] = (0.0, 0.0, -9.81)
 
     # TODO(Steven, Pepijn): Not used ... ?
     # MIT control parameters (used when manual_control=False for torque control)

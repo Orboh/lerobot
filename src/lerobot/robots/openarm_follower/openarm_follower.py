@@ -22,6 +22,7 @@ from typing import Any
 from lerobot.cameras import make_cameras_from_configs
 from lerobot.motors import Motor, MotorCalibration, MotorNormMode
 from lerobot.motors.damiao import DamiaoMotorsBus
+from lerobot.motors.damiao.damiao_alignment import OPENARM_INITIAL_POSITION_DEG, soft_move_to_position
 from lerobot.types import RobotAction, RobotObservation
 from lerobot.utils.decorators import check_if_already_connected, check_if_not_connected
 
@@ -150,6 +151,20 @@ class OpenArmFollower(Robot):
 
         self.bus.enable_torque()
 
+        # Startup alignment (official AdjustPosition port): softly move to the
+        # fixed initial pose so the follower starts matched with the leader.
+        # Placed after set_zero_position so the pose targets use the fresh zero.
+        if self.config.align_on_connect:
+            goal = {
+                motor: min(
+                    max(pos, self.config.joint_limits[motor][0]), self.config.joint_limits[motor][1]
+                )
+                if motor in self.config.joint_limits
+                else pos
+                for motor, pos in OPENARM_INITIAL_POSITION_DEG.items()
+            }
+            soft_move_to_position(self.bus, goal, self.config.align_duration_s)
+
         logger.info(f"{self} connected.")
 
     @property
@@ -274,6 +289,12 @@ class OpenArmFollower(Robot):
         """
 
         goal_pos = {key.removesuffix(".pos"): val for key, val in action.items() if key.endswith(".pos")}
+        # Velocity feed-forward: pass the leader's joint velocity into the MIT `vel`
+        # term so Kd acts as velocity tracking (smooth) rather than pure damping
+        # (which causes stick-slip "buzz"). Matches the official C++ teleop, whose
+        # follower MIT uses the leader velocity. Empty if the teleop doesn't emit
+        # `.vel` (use_velocity_and_torque=False) -> falls back to 0.0 (legacy).
+        goal_vel = {key.removesuffix(".vel"): val for key, val in action.items() if key.endswith(".vel")}
 
         # Apply joint limit clipping to arm
         for motor_name, position in goal_pos.items():
@@ -325,7 +346,14 @@ class OpenArmFollower(Robot):
                     if isinstance(self.config.position_kd, list)
                     else self.config.position_kd
                 )
-            commands[motor_name] = (kp, kd, position_degrees, 0.0, 0.0)
+            vel_ff = goal_vel.get(motor_name)
+            commands[motor_name] = (
+                kp,
+                kd,
+                position_degrees,
+                float(vel_ff) if vel_ff is not None else 0.0,
+                0.0,
+            )
 
         self.bus._mit_control_batch(commands)
 
