@@ -22,6 +22,7 @@ import numpy as np
 
 from lerobot.motors import Motor, MotorCalibration, MotorNormMode
 from lerobot.motors.damiao import DamiaoMotorsBus
+from lerobot.motors.damiao.damiao_alignment import OPENARM_INITIAL_POSITION_DEG, soft_move_to_position
 from lerobot.types import RobotAction
 from lerobot.utils.decorators import check_if_already_connected, check_if_not_connected
 
@@ -119,6 +120,17 @@ class OpenArmLeader(Teleoperator):
 
         if self.is_calibrated:
             self.bus.set_zero_position()
+
+        # Startup alignment (official AdjustPosition port): softly move to the
+        # fixed initial pose so leader and follower start matched. Needs torque,
+        # so pure manual_control (torque-off) mode skips it. In gravity mode the
+        # arm holds the pose (soft position hold) until the teleop loop's first
+        # gravity injection takes over and makes it weightless again.
+        if self.config.align_on_connect:
+            if self.config.gravity_compensation or not self.config.manual_control:
+                soft_move_to_position(self.bus, OPENARM_INITIAL_POSITION_DEG, self.config.align_duration_s)
+            else:
+                logger.info("align_on_connect skipped: manual_control keeps torque disabled.")
 
         logger.info(f"{self} connected.")
 

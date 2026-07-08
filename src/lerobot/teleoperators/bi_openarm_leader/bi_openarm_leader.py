@@ -57,6 +57,8 @@ class BiOpenArmLeader(Teleoperator):
             gravity_side="left",
             gravity_scale=config.left_arm_config.gravity_scale,
             gravity_vector=config.left_arm_config.gravity_vector,
+            align_on_connect=config.left_arm_config.align_on_connect,
+            align_duration_s=config.left_arm_config.align_duration_s,
         )
 
         right_arm_config = OpenArmLeaderConfig(
@@ -77,6 +79,8 @@ class BiOpenArmLeader(Teleoperator):
             gravity_side="right",
             gravity_scale=config.right_arm_config.gravity_scale,
             gravity_vector=config.right_arm_config.gravity_vector,
+            align_on_connect=config.right_arm_config.align_on_connect,
+            align_duration_s=config.right_arm_config.align_duration_s,
         )
 
         self.left_arm = OpenArmLeader(left_arm_config)

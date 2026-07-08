@@ -22,6 +22,7 @@ from typing import Any
 from lerobot.cameras import make_cameras_from_configs
 from lerobot.motors import Motor, MotorCalibration, MotorNormMode
 from lerobot.motors.damiao import DamiaoMotorsBus
+from lerobot.motors.damiao.damiao_alignment import OPENARM_INITIAL_POSITION_DEG, soft_move_to_position
 from lerobot.types import RobotAction, RobotObservation
 from lerobot.utils.decorators import check_if_already_connected, check_if_not_connected
 
@@ -149,6 +150,20 @@ class OpenArmFollower(Robot):
             self.bus.set_zero_position()
 
         self.bus.enable_torque()
+
+        # Startup alignment (official AdjustPosition port): softly move to the
+        # fixed initial pose so the follower starts matched with the leader.
+        # Placed after set_zero_position so the pose targets use the fresh zero.
+        if self.config.align_on_connect:
+            goal = {
+                motor: min(
+                    max(pos, self.config.joint_limits[motor][0]), self.config.joint_limits[motor][1]
+                )
+                if motor in self.config.joint_limits
+                else pos
+                for motor, pos in OPENARM_INITIAL_POSITION_DEG.items()
+            }
+            soft_move_to_position(self.bus, goal, self.config.align_duration_s)
 
         logger.info(f"{self} connected.")
 

@@ -76,6 +76,16 @@ class OpenArmFollowerConfigBase:
     # Set to a positive scalar for all motors, or a dict mapping motor names to limits
     max_relative_target: float | dict[str, float] | None = None
 
+    # --- Startup alignment (official AdjustPosition port) ---------------------
+    # On connect, softly interpolate the arm from its current pose to the fixed
+    # initial pose (all joints 0, elbow joint_4 = 36 deg, gripper 0) with gains
+    # much softer than the teleop gains, mirroring the official openarm_teleop
+    # startup. Leader and follower both aligning to the same pose means teleop
+    # starts matched, with no manual pose alignment and no jump on the first
+    # tracking command.
+    align_on_connect: bool = True
+    align_duration_s: float = 2.2
+
     # Camera configurations
     cameras: dict[str, CameraConfig] = field(default_factory=dict)
 

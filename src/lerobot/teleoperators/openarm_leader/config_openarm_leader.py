@@ -60,6 +60,15 @@ class OpenArmLeaderConfigBase:
     # When enabled, motors have torque disabled for manual movement
     manual_control: bool = True
 
+    # --- Startup alignment (official AdjustPosition port) ---------------------
+    # On connect, softly interpolate the arm from its current pose to the fixed
+    # initial pose (all joints 0, elbow joint_4 = 36 deg, gripper 0), mirroring
+    # the official openarm_teleop startup so leader and follower start matched.
+    # Needs torque, so it only runs in gravity_compensation or MIT/position
+    # mode; pure manual_control (torque-off) skips it.
+    align_on_connect: bool = True
+    align_duration_s: float = 2.2
+
     # When True, expose `.vel` and `.torque` per motor in action features.
     # Default False for compatibility with the position-only openarm_mini teleoperator.
     use_velocity_and_torque: bool = False
