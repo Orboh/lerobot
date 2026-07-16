@@ -122,17 +122,133 @@ def predict_action(
     return action
 
 
+def _decode_control_key(data: bytes):
+    """Map a raw key / escape sequence read from a TTY to a control-flow event name.
+
+    Returns ``"next"`` (right arrow), ``"rerecord"`` (left arrow), ``"stop"`` (esc),
+    or ``None``. Handles both CSI (``\\x1b[C``) and application-cursor (``\\x1bOC``)
+    arrow encodings as well as a bare escape byte.
+    """
+    if not data:
+        return None
+    if data == b"\x1b":
+        return "stop"  # bare escape
+    if data[:1] == b"\x1b":
+        last = data[-1:]
+        if last == b"C":
+            return "next"  # right arrow
+        if last == b"D":
+            return "rerecord"  # left arrow
+    return None
+
+
+def _init_stdin_key_listener(events):
+    """Headless fallback that reads recording control keys from the controlling TTY.
+
+    On Linux, pynput's listener needs a display (X/Wayland) and silently receives no
+    events over a plain SSH session even when ``import pynput`` succeeds. When no
+    display is available we instead put the terminal into cbreak mode and read the
+    arrow keys / esc directly from stdin in a background thread, setting the same
+    ``events`` flags as the pynput path (right arrow = next episode, left arrow =
+    rerecord last episode, esc = stop recording).
+
+    Returns an object exposing ``start()`` / ``stop()`` (mirroring pynput's Listener),
+    or ``None`` when stdin is not an interactive TTY or termios is unavailable (e.g.
+    Windows or a piped/non-interactive stdin), preserving the previous no-keyboard
+    behaviour in those cases.
+    """
+    import sys
+
+    try:
+        import atexit
+        import os
+        import select
+        import termios
+        import threading
+        import tty
+    except Exception:
+        return None
+
+    if not sys.stdin.isatty():
+        return None
+
+    fd = sys.stdin.fileno()
+
+    class _StdinKeyListener:
+        def __init__(self):
+            self._old_term = None
+            self._thread = None
+            self._stop_evt = threading.Event()
+
+        def start(self):
+            self._old_term = termios.tcgetattr(fd)
+            tty.setcbreak(fd)
+            atexit.register(self.stop)
+            self._thread = threading.Thread(
+                target=self._run, name="stdin-key-listener", daemon=True
+            )
+            self._thread.start()
+
+        def _run(self):
+            try:
+                while not self._stop_evt.is_set():
+                    ready, _, _ = select.select([fd], [], [], 0.1)
+                    if not ready:
+                        continue
+                    ch = os.read(fd, 1)
+                    if ch != b"\x1b":
+                        continue
+                    seq = b"\x1b"
+                    # Grab the rest of an escape sequence if it arrived in the same burst.
+                    more, _, _ = select.select([fd], [], [], 0.02)
+                    if more:
+                        seq += os.read(fd, 8)
+                    action = _decode_control_key(seq)
+                    if action == "next":
+                        print("Right arrow key pressed. Exiting loop...")
+                        events["exit_early"] = True
+                    elif action == "rerecord":
+                        print("Left arrow key pressed. Exiting loop and rerecord the last episode...")
+                        events["rerecord_episode"] = True
+                        events["exit_early"] = True
+                    elif action == "stop":
+                        print("Escape key pressed. Stopping data recording...")
+                        events["stop_recording"] = True
+                        events["exit_early"] = True
+            except Exception as e:
+                print(f"Error handling key press: {e}")
+
+        def stop(self):
+            self._stop_evt.set()
+            if self._old_term is not None:
+                try:
+                    termios.tcsetattr(fd, termios.TCSADRAIN, self._old_term)
+                except Exception:
+                    pass
+                self._old_term = None
+
+    listener = _StdinKeyListener()
+    listener.start()
+    return listener
+
+
 def init_keyboard_listener():
     """
     Initializes a non-blocking keyboard listener for real-time user interaction.
 
     This function sets up a listener for specific keys (right arrow, left arrow, escape) to control
-    the program flow during execution, such as stopping recording or exiting loops. It gracefully
-    handles headless environments where keyboard listening is not possible.
+    the program flow during execution, such as stopping recording or exiting loops.
+
+    When a graphical display is available it uses ``pynput``. On Linux without a display
+    (e.g. a plain SSH session) pynput cannot receive key events, so it falls back to reading
+    the same control keys from the controlling TTY via termios, keeping headless data
+    collection controllable. If no interactive TTY is available either, keyboard input is
+    disabled (as before).
 
     Returns:
         A tuple containing:
-        - The `pynput.keyboard.Listener` instance, or `None` if in a headless environment.
+        - A listener instance exposing ``start()`` / ``stop()`` (pynput's ``Listener`` or the
+          stdin fallback), or ``None`` if no keyboard input is possible.
         - A dictionary of event flags (e.g., `exit_early`) that are set by key presses.
     """
     # Allow to exit early while recording an episode or resetting the environment,
@@ -143,14 +259,35 @@ def init_keyboard_listener():
     events["rerecord_episode"] = False
     events["stop_recording"] = False
 
-    if is_headless():
-        logging.warning(
-            "Headless environment detected. On-screen cameras display and keyboard inputs will not be available."
+    import os
+    import sys
+
+    # pynput's global key listener needs a graphical display (X/Wayland) on Linux and
+    # therefore receives nothing over a plain SSH session, even when `import pynput`
+    # succeeds (so `is_headless()` returns False). Use pynput only when a display is
+    # actually available; otherwise fall back to reading control keys from the TTY.
+    use_pynput = not is_headless()
+    if sys.platform not in ("darwin", "win32"):
+        use_pynput = use_pynput and bool(
+            os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")
         )
-        listener = None
+
+    if not use_pynput:
+        listener = _init_stdin_key_listener(events)
+        if listener is None:
+            logging.warning(
+                "Headless environment with no interactive TTY detected. On-screen cameras "
+                "display and keyboard inputs will not be available."
+            )
+        else:
+            logging.info(
+                "No display detected: reading recording control keys from stdin "
+                "(right arrow = next, left arrow = rerecord, esc = stop). "
+                "On-screen camera display will not be available."
+            )
         return listener, events
 
-    # Only import pynput if not in a headless environment
+    # Only import pynput when a display is available
     from pynput import keyboard
 
     def on_press(key):
