@@ -22,7 +22,12 @@ from typing import Any
 from lerobot.cameras import make_cameras_from_configs
 from lerobot.motors import Motor, MotorCalibration, MotorNormMode
 from lerobot.motors.damiao import DamiaoMotorsBus
-from lerobot.motors.damiao.damiao_alignment import OPENARM_INITIAL_POSITION_DEG, soft_move_to_position
+from lerobot.motors.damiao.damiao_alignment import (
+    check_start_position,
+    resolve_initial_pose,
+    should_rezero_on_connect,
+    soft_move_to_position,
+)
 from lerobot.types import RobotAction, RobotObservation
 from lerobot.utils.decorators import check_if_already_connected, check_if_not_connected
 
@@ -144,25 +149,43 @@ class OpenArmFollower(Robot):
         for cam in self.cameras.values():
             cam.connect()
 
+        # Persistent zero: decide ONCE whether to burn a fresh motor-side zero at
+        # the current pose (legacy, forces the operator to hang the arm down
+        # identically every session) or to trust the software homing offsets in
+        # the calibration file (new flow; the frame is stable across sessions and
+        # power cycles). See should_rezero_on_connect for the auto rule.
+        rezero = should_rezero_on_connect(self.bus.calibration, self.config.rezero_on_connect)
+        if not rezero and self.config.align_on_connect:
+            # No re-zero -> the frame must already be valid. Refuse to run the
+            # startup alignment move if the readings look grossly out of frame
+            # (stale zero after power cycle etc.). Gated on align_on_connect so
+            # a motion-free connect (e.g. lerobot-calibrate re-calibrating a
+            # stale frame with align disabled) is never dead-locked by the check.
+            check_start_position(
+                self.bus,
+                self.config.joint_limits,
+                self.config.start_position_tolerance_deg,
+                label=str(self),
+            )
+
         self.configure()
 
-        if self.is_calibrated:
+        if rezero:
             self.bus.set_zero_position()
 
         self.bus.enable_torque()
 
         # Startup alignment (official AdjustPosition port): softly move to the
-        # fixed initial pose so the follower starts matched with the leader.
-        # Placed after set_zero_position so the pose targets use the fresh zero.
+        # initial pose so the follower starts matched with the leader. The target
+        # is the captured "ready" pose (initial_pose_path / initial_pose_deg) or
+        # the official default; it is clamped into joint_limits. Placed after
+        # set_zero_position so the pose targets use the fresh zero.
         if self.config.align_on_connect:
-            goal = {
-                motor: min(
-                    max(pos, self.config.joint_limits[motor][0]), self.config.joint_limits[motor][1]
-                )
-                if motor in self.config.joint_limits
-                else pos
-                for motor, pos in OPENARM_INITIAL_POSITION_DEG.items()
-            }
+            goal = resolve_initial_pose(
+                initial_pose_deg=self.config.initial_pose_deg,
+                initial_pose_path=self.config.initial_pose_path,
+                joint_limits=self.config.joint_limits,
+            )
             soft_move_to_position(self.bus, goal, self.config.align_duration_s)
 
         logger.info(f"{self} connected.")
@@ -174,14 +197,25 @@ class OpenArmFollower(Robot):
 
     def calibrate(self) -> None:
         """
-        Run calibration procedure for OpenArms robot.
+        Run calibration procedure for OpenArms robot (persistent software zero).
 
         The calibration procedure:
         1. Disable torque
-        2. Ask user to position arms in hanging position with grippers closed
-        3. Set this as zero position
-        4. Record range of motion for each joint
-        5. Save calibration
+        2. Ask user to position the arm hanging straight down, gripper closed
+        3. Read the motors' NATIVE positions at that reference and store them as
+           software homing offsets in the calibration file (logical zero =
+           hang-down = URDF zero). The motor-side zero (Damiao 0xFE) is
+           intentionally NOT burned: DM motors have a single-turn absolute
+           encoder, so native readings are repeatable across power cycles, while
+           0xFE flash persistence is firmware-dependent — the software offset is
+           robust either way. Burn the motor zero out-of-band with the official
+           tools (openarm-can-cli set_zero) only if you need the native frame
+           itself re-centered, then re-run this calibration.
+        4. Save calibration (with the fixed ±90° default range)
+
+        Once a calibration with homing offsets exists, connect() stops re-zeroing
+        every session (see rezero_on_connect) — the start frame is fixed and
+        reproducible without hanging the arm down at each startup.
         """
         if self.calibration:
             # Calibration file exists, ask user whether to use it or run new calibration
@@ -196,25 +230,43 @@ class OpenArmFollower(Robot):
         logger.info(f"\nRunning calibration for {self}")
         self.bus.disable_torque()
 
-        # Step 1: Set zero position
+        # Step 1: capture the reference pose (software homing offsets)
         input(
-            "\nCalibration: Set Zero Position)\n"
+            "\nCalibration: capture reference (persistent software zero)\n"
+            "If a motor-side zero was ever written this session, POWER-CYCLE the arm first\n"
+            "(so the captured offsets reference the persistent boot frame).\n"
             "Position the arm in the following configuration:\n"
             "  - Arm hanging straight down\n"
             "  - Gripper closed\n"
             "Press ENTER when ready..."
         )
 
-        # Set current position as zero for all motors
-        self.bus.set_zero_position()
-        logger.info("Arm zero position set.")
+        raw_positions = self.bus.read_raw_positions()
+        missing = [motor for motor in self.bus.motors if motor not in raw_positions]
+        if missing:
+            raise RuntimeError(
+                f"Calibration aborted: no position response from {missing}. "
+                "Check CAN wiring / motor power and retry."
+            )
+        logger.info(
+            "Captured homing offsets (deg): "
+            + ", ".join(f"{m}={v:.2f}" for m, v in raw_positions.items())
+        )
+        for motor_name, offset in raw_positions.items():
+            if abs(offset) > 120.0:
+                logger.warning(
+                    f"{motor_name}: homing offset {offset:.1f} deg is close to the ±180 deg "
+                    "single-turn window; boot-time readings may wrap. Consider burning the motor "
+                    "zero once at this pose (openarm-can-cli set_zero), power-cycling, and "
+                    "re-running this calibration so offsets end up near 0."
+                )
 
         logger.info("Setting range: -90° to +90° for safety by default for all joints")
         for motor_name, motor in self.bus.motors.items():
             self.calibration[motor_name] = MotorCalibration(
                 id=motor.id,
                 drive_mode=0,
-                homing_offset=0,
+                homing_offset=raw_positions[motor_name],
                 range_min=-90,
                 range_max=90,
             )

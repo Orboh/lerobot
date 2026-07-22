@@ -175,7 +175,11 @@ class MotorNormMode(str, Enum):
 class MotorCalibration:
     id: int
     drive_mode: int
-    homing_offset: int
+    # Serial buses (Dynamixel/Feetech) store integer encoder ticks; the Damiao CAN
+    # bus stores a float software offset in DEGREES (motors can't persist a
+    # calibration internally, see DamiaoMotorsBus). `float` accepts both, and
+    # draccus loads legacy int JSON values into a float field without complaint.
+    homing_offset: float
     range_min: int
     range_max: int
 

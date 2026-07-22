@@ -68,6 +68,10 @@ class BiOpenArmFollower(Robot):
             joint_limits=config.left_arm_config.joint_limits,
             align_on_connect=config.left_arm_config.align_on_connect,
             align_duration_s=config.left_arm_config.align_duration_s,
+            initial_pose_path=config.left_arm_config.initial_pose_path,
+            initial_pose_deg=config.left_arm_config.initial_pose_deg,
+            rezero_on_connect=config.left_arm_config.rezero_on_connect,
+            start_position_tolerance_deg=config.left_arm_config.start_position_tolerance_deg,
         )
 
         right_arm_config = OpenArmFollowerConfig(
@@ -89,6 +93,10 @@ class BiOpenArmFollower(Robot):
             joint_limits=config.right_arm_config.joint_limits,
             align_on_connect=config.right_arm_config.align_on_connect,
             align_duration_s=config.right_arm_config.align_duration_s,
+            initial_pose_path=config.right_arm_config.initial_pose_path,
+            initial_pose_deg=config.right_arm_config.initial_pose_deg,
+            rezero_on_connect=config.right_arm_config.rezero_on_connect,
+            start_position_tolerance_deg=config.right_arm_config.start_position_tolerance_deg,
         )
 
         self.left_arm = OpenArmFollower(left_arm_config)

@@ -151,6 +151,24 @@ class DamiaoMotorsBus(MotorsBusBase):
         # Defaults: Kp=10.0 (Stiffness), Kd=0.5 (Damping)
         self._gains: dict[str, dict[str, float]] = {name: {"kp": 10.0, "kd": 0.5} for name in self.motors}
 
+        # Software homing offsets in DEGREES, loaded from the calibration file.
+        # Damiao motors cannot persist a calibration internally and the 0xFE
+        # "set zero" command's flash persistence is firmware-dependent, so the
+        # repeatable zero lives HERE: positions decoded from the bus are in the
+        # motor's native frame ("raw"); every read SUBTRACTS the offset and every
+        # MIT position command ADDS it back, so all callers work in a stable
+        # logical frame whose zero is the calibration reference pose (arm hanging
+        # straight down = URDF zero). Legacy calibrations carry offset 0, making
+        # the transform an exact no-op.
+        self._homing_offsets: dict[str, float] = dict.fromkeys(self.motors, 0.0)
+        self._refresh_homing_offsets()
+
+    def _refresh_homing_offsets(self) -> None:
+        """Rebuild the raw<->logical position offsets from the cached calibration."""
+        for name in self.motors:
+            cal = self.calibration.get(name) if self.calibration else None
+            self._homing_offsets[name] = float(cal.homing_offset) if cal is not None else 0.0
+
     @property
     def is_connected(self) -> bool:
         """Check if the CAN bus is connected."""
@@ -237,7 +255,10 @@ class DamiaoMotorsBus(MotorsBusBase):
             if response is None:
                 missing_motors.append(motor_name)
             else:
-                self._process_response(motor_name, msg)
+                # NOTE: must decode the motor's RESPONSE, not the enable command we
+                # sent (decoding the sent 0xFF.. payload used to seed the state
+                # cache with a garbage position of +position_max degrees).
+                self._process_response(motor_name, response)
             time.sleep(MEDIUM_TIMEOUT_SEC)
 
         if missing_motors:
@@ -333,9 +354,24 @@ class DamiaoMotorsBus(MotorsBusBase):
             self.enable_torque(motors)
 
     def set_zero_position(self, motors: str | list[str] | None = None) -> None:
-        """Set current position as zero for selected motors."""
+        """Set current position as zero for selected motors (Damiao 0xFE command).
+
+        This re-frames the motor's NATIVE zero, so any stored software homing
+        offset becomes stale and is cleared (in memory and in the cached
+        calibration — the calibration file on disk is NOT rewritten here; re-run
+        the calibration to restore persistent-zero mode).
+        """
         target_motors = self._get_motors_list(motors)
         for motor in target_motors:
+            if self._homing_offsets.get(motor, 0.0) != 0.0:
+                logger.warning(
+                    f"set_zero_position({motor}): burning a new motor zero clears the stored "
+                    f"homing offset ({self._homing_offsets[motor]:.2f} deg). Re-run calibration "
+                    "to restore the persistent software zero."
+                )
+            self._homing_offsets[motor] = 0.0
+            if self.calibration and motor in self.calibration:
+                self.calibration[motor].homing_offset = 0.0
             self._send_simple_command(motor, CAN_CMD_SET_ZERO)
             time.sleep(MEDIUM_TIMEOUT_SEC)
 
@@ -479,7 +515,10 @@ class DamiaoMotorsBus(MotorsBusBase):
         if self.canbus is None:
             raise RuntimeError("CAN bus is not initialized.")
 
-        data = self._encode_mit_packet(motor_type, kp, kd, position_degrees, velocity_deg_per_sec, torque)
+        # Positions are commanded in the logical (calibrated) frame; convert to
+        # the motor's native frame by adding the homing offset back.
+        raw_position = position_degrees + self._homing_offsets.get(motor_name, 0.0)
+        data = self._encode_mit_packet(motor_type, kp, kd, raw_position, velocity_deg_per_sec, torque)
         msg = can.Message(arbitration_id=motor_id, data=data, is_extended_id=False, is_fd=self.use_can_fd)
         self.canbus.send(msg)
 
@@ -515,7 +554,9 @@ class DamiaoMotorsBus(MotorsBusBase):
             motor_name = self._get_motor_name(motor)
             motor_type = self._motor_types[motor_name]
 
-            data = self._encode_mit_packet(motor_type, kp, kd, position_degrees, velocity_deg_per_sec, torque)
+            # Logical -> native frame (see _homing_offsets).
+            raw_position = position_degrees + self._homing_offsets.get(motor_name, 0.0)
+            data = self._encode_mit_packet(motor_type, kp, kd, raw_position, velocity_deg_per_sec, torque)
             msg = can.Message(arbitration_id=motor_id, data=data, is_extended_id=False, is_fd=self.use_can_fd)
             self.canbus.send(msg)
 
@@ -568,10 +609,16 @@ class DamiaoMotorsBus(MotorsBusBase):
         return np.degrees(position_rad), np.degrees(velocity_rad_per_sec), torque, t_mos, t_rotor
 
     def _process_response(self, motor: str, msg: can.Message) -> None:
-        """Decode a message and update the motor state cache."""
+        """Decode a message and update the motor state cache.
+
+        Positions are cached in the LOGICAL frame: the software homing offset is
+        subtracted from the decoded native-frame position (see _homing_offsets).
+        Velocity and torque are frame-independent (the offset is constant).
+        """
         try:
             motor_type = self._motor_types[motor]
             pos, vel, torque, t_mos, t_rotor = self._decode_motor_state(msg.data, motor_type)
+            pos -= self._homing_offsets.get(motor, 0.0)
 
             self._last_known_states[motor] = {
                 "position": pos,
@@ -673,8 +720,13 @@ class DamiaoMotorsBus(MotorsBusBase):
             result[motor] = self._last_known_states[motor].copy()
         return result
 
-    def _batch_refresh(self, motors: list[str]) -> None:
-        """Internal helper to refresh a list of motors and update cache."""
+    def _batch_refresh(self, motors: list[str]) -> set[str]:
+        """Internal helper to refresh a list of motors and update cache.
+
+        Returns:
+            The set of motor names that actually responded in this refresh cycle
+            (motors missing from the set keep their last known cached state).
+        """
 
         if self.canbus is None:
             raise RuntimeError("CAN bus is not initialized.")
@@ -693,13 +745,16 @@ class DamiaoMotorsBus(MotorsBusBase):
         responses = self._recv_all_responses(expected_recv_ids, timeout=MEDIUM_TIMEOUT_SEC)
 
         # Update cache
+        refreshed: set[str] = set()
         for motor in motors:
             recv_id = self._get_motor_recv_id(motor)
             msg = responses.get(recv_id)
             if msg:
                 self._process_response(motor, msg)
+                refreshed.add(motor)
             else:
                 logger.warning(f"Packet drop: {motor} (ID: 0x{recv_id:02X}). Using last known state.")
+        return refreshed
 
     @check_if_not_connected
     def sync_write(self, data_name: str, values: dict[str, Value]) -> None:
@@ -725,7 +780,9 @@ class DamiaoMotorsBus(MotorsBusBase):
                 kp = self._gains[motor]["kp"]
                 kd = self._gains[motor]["kd"]
 
-                data = self._encode_mit_packet(motor_type, kp, kd, float(value_degrees), 0.0, 0.0)
+                # Logical -> native frame (see _homing_offsets).
+                raw_position = float(value_degrees) + self._homing_offsets.get(motor_name, 0.0)
+                data = self._encode_mit_packet(motor_type, kp, kd, raw_position, 0.0, 0.0)
                 msg = can.Message(
                     arbitration_id=motor_id, data=data, is_extended_id=False, is_fd=self.use_can_fd
                 )
@@ -744,6 +801,23 @@ class DamiaoMotorsBus(MotorsBusBase):
             for motor, value in values.items():
                 self.write(data_name, motor, value)
 
+    def read_raw_positions(self, motors: str | list[str] | None = None) -> dict[str, float]:
+        """Read Present_Position in the motor's NATIVE frame (homing offset NOT subtracted).
+
+        Used by the calibration flow to measure the software homing offset at a
+        physical reference pose. Motors that did not respond in the refresh cycle
+        are omitted from the result (callers must check for missing motors before
+        trusting the values).
+        """
+        target_motors = self._get_motors_list(motors)
+        refreshed = self._batch_refresh(target_motors)
+        raw: dict[str, float] = {}
+        for motor in target_motors:
+            if motor in refreshed:
+                state = self._last_known_states[motor]
+                raw[motor] = state["position"] + self._homing_offsets.get(motor, 0.0)
+        return raw
+
     def read_calibration(self) -> dict[str, MotorCalibration]:
         """Read calibration data from motors."""
         # Damiao motors don't store calibration internally
@@ -753,9 +827,10 @@ class DamiaoMotorsBus(MotorsBusBase):
     def write_calibration(self, calibration_dict: dict[str, MotorCalibration], cache: bool = True) -> None:
         """Write calibration data to motors."""
         # Damiao motors don't store calibration internally
-        # Just cache it in memory
+        # Just cache it in memory (and activate its homing offsets)
         if cache:
             self.calibration = calibration_dict
+            self._refresh_homing_offsets()
 
     def record_ranges_of_motion(
         self,

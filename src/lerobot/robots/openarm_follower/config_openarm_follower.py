@@ -76,6 +76,28 @@ class OpenArmFollowerConfigBase:
     # Set to a positive scalar for all motors, or a dict mapping motor names to limits
     max_relative_target: float | dict[str, float] | None = None
 
+    # --- Persistent zero (software homing offsets) ----------------------------
+    # Whether connect() burns a new motor-side zero (Damiao 0xFE) at the current
+    # physical pose.
+    #   None (default, auto): legacy calibrations (homing offsets all zero) keep
+    #     the historical per-session re-zero; calibrations captured with the new
+    #     calibrate() flow carry non-zero homing offsets and skip the burn — the
+    #     zero then persists across sessions/power cycles via the calibration
+    #     file, so the arm does NOT have to be hung down identically at every
+    #     startup.
+    #   True: always re-zero at connect (forces the legacy behavior; clears any
+    #     stored homing offsets for the session).
+    #   False: never re-zero at connect (requires a valid homing-offset
+    #     calibration or a motor zero known to be correct).
+    rezero_on_connect: bool | None = None
+
+    # When the per-session re-zero is skipped, connect() sanity-checks that all
+    # joints read within joint_limits widened by this many degrees BEFORE
+    # enabling the startup alignment move. Catches a stale frame (motor zero
+    # reverted after power cycle, wrong calibration file, boot-time wrap) that
+    # would otherwise drive the arm to a wrong physical pose. None disables.
+    start_position_tolerance_deg: float | None = 30.0
+
     # --- Startup alignment (official AdjustPosition port) ---------------------
     # On connect, softly interpolate the arm from its current pose to the fixed
     # initial pose (all joints 0, elbow joint_4 = 36 deg, gripper 0) with gains
@@ -85,6 +107,15 @@ class OpenArmFollowerConfigBase:
     # tracking command.
     align_on_connect: bool = True
     align_duration_s: float = 2.2
+
+    # Startup alignment target. By default the arm aligns to the official
+    # OPENARM_INITIAL_POSITION_DEG (all joints 0, elbow 36 deg). To start teleop
+    # from a custom "ready" pose (e.g. elbow bent + arm raised), point
+    # initial_pose_path at a per-side YAML captured with
+    # scripts/capture_initial_pose.sh; initial_pose_deg overrides it inline.
+    # Missing joints fall back to the default; values are clamped to joint_limits.
+    initial_pose_path: str | None = None
+    initial_pose_deg: dict[str, float] | None = None
 
     # Camera configurations
     cameras: dict[str, CameraConfig] = field(default_factory=dict)

@@ -60,6 +60,20 @@ class OpenArmLeaderConfigBase:
     # When enabled, motors have torque disabled for manual movement
     manual_control: bool = True
 
+    # --- Persistent zero (software homing offsets) ----------------------------
+    # Same semantics as OpenArmFollowerConfigBase.rezero_on_connect:
+    #   None (auto): legacy calibrations (offsets all zero) keep the historical
+    #     per-session re-zero; homing-offset calibrations skip it (persistent
+    #     zero, no need to hang the arm down at every startup).
+    #   True: always re-zero at connect (legacy).  False: never.
+    rezero_on_connect: bool | None = None
+
+    # When the per-session re-zero is skipped AND the leader will apply torque
+    # (gravity_compensation or MIT mode), connect() sanity-checks that all
+    # joints read within the side's physical limits widened by this many
+    # degrees before moving. None disables.
+    start_position_tolerance_deg: float | None = 30.0
+
     # --- Startup alignment (official AdjustPosition port) ---------------------
     # On connect, softly interpolate the arm from its current pose to the fixed
     # initial pose (all joints 0, elbow joint_4 = 36 deg, gripper 0), mirroring
@@ -68,6 +82,14 @@ class OpenArmLeaderConfigBase:
     # mode; pure manual_control (torque-off) skips it.
     align_on_connect: bool = True
     align_duration_s: float = 2.2
+
+    # Startup alignment target (see OpenArmFollowerConfigBase for the full note).
+    # Point initial_pose_path at a per-side YAML captured with
+    # scripts/capture_initial_pose.sh to start from a custom "ready" pose;
+    # initial_pose_deg overrides it inline. In gravity_compensation mode the
+    # alignment injects gravity feed-forward so a raised pose is reached/held.
+    initial_pose_path: str | None = None
+    initial_pose_deg: dict[str, float] | None = None
 
     # When True, expose `.vel` and `.torque` per motor in action features.
     # Default False for compatibility with the position-only openarm_mini teleoperator.
