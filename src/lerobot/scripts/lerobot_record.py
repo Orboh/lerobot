@@ -102,6 +102,7 @@ from lerobot.common.control_utils import (
     init_keyboard_listener,
     is_headless,
     sanity_check_dataset_robot_compatibility,
+    wait_for_episode_cue,
     wait_for_start_pose,
 )
 from lerobot.configs import parser
@@ -183,31 +184,45 @@ class RecordConfig:
     play_sounds: bool = True
     # Resume recording on an existing dataset.
     resume: bool = False
-    # Per-episode start-pose gate. None (default) disables it, preserving the
-    # plain manual reset. When set, an episode does not start until every gated
-    # joint is within this many degrees of the pose captured right after connect
-    # (i.e. after the robot's own startup alignment): the operator brings the arm
-    # back by hand, or presses 'a' to have the leader driven there. The right
-    # arrow records anyway, esc stops. Without this gate the startup alignment
-    # only fires once per session, so each episode starts from a slightly
-    # different pose (measured on OpenArm: a fifth to a quarter of the joint
-    # range on J1/J4/J6/J7). Keep literal percent signs out of these comments:
-    # draccus turns them into argparse help strings, and a stray percent sign
-    # there breaks --help for the whole CLI.
-
+    # How far a joint may sit from the start pose, in degrees. None (default)
+    # leaves the start pose unmanaged, which is how recording behaved before.
+    # The reference pose is the one read right after connect, i.e. after the
+    # robot's own startup alignment. What the number gates depends on
+    # episode_advance: with "manual" it verifies the operator-cued return landed;
+    # with "auto" it is the threshold an episode must satisfy before it starts,
+    # with the operator bringing the arm back by hand. It matters because the
+    # startup alignment only fires once per session, so a per-episode manual
+    # reset makes every episode start from a slightly different pose (measured on
+    # OpenArm: a fifth to a quarter of the joint range on J1/J4/J6/J7), and a
+    # policy trained on few episodes regresses toward that mean pose.
+    # Keep literal percent signs out of these comments: draccus turns them into
+    # argparse help strings, and a stray percent sign there breaks --help.
     start_pose_tolerance_deg: float | None = None
-    # Stop waiting for the start pose after this long and record anyway, so an
-    # unattended session cannot block forever on the gate.
+    # Only used when episode_advance="auto": stop waiting for the start pose after
+    # this long and record anyway, so an unattended session cannot block forever.
+    # The "manual" flow waits indefinitely instead, since a human is always there.
     start_pose_max_wait_s: float = 120.0
-    # Also gate the gripper. Off by default: its value at episode end legitimately
-    # depends on what was grasped, and startup pins it to its calibration zero.
+    # Include the gripper in the start-pose check. Off by default: what it reads
+    # at the end of an episode legitimately depends on what was grasped, so
+    # checking it produces noise. This only affects the check — the gripper is
+    # always part of what the arm is returned to, matching what lerobot-rollout
+    # restores between inference episodes.
     start_pose_gate_gripper: bool = False
     # Append one JSON line per episode with the start-pose deviation to this file
     # (the collection manifest). None disables the file; deviations are logged to
     # the console either way.
     start_pose_log_path: str | None = None
+    # How the recording advances between episodes.
+    #   "auto"   - the timed flow: a fixed reset window, then the next episode
+    #              starts on its own. Good for batching through episodes quickly.
+    #   "manual" - the operator drives the boundary: 'a' returns both arms to the
+    #              start pose (clearing the workspace first), then the right arrow
+    #              starts the next episode once the scene is restored.
+    episode_advance: str = "auto"
 
     def __post_init__(self):
+        if self.episode_advance not in ("auto", "manual"):
+            raise ValueError(f"episode_advance must be 'auto' or 'manual', got {self.episode_advance!r}")
         if self.teleop is None:
             raise ValueError(
                 "A teleoperator is required for recording. "
@@ -247,7 +262,7 @@ def _log_start_pose_deviation(
     episode_index: int,
     deviation: dict[str, float],
     outcome: str,
-    tolerance_deg: float,
+    tolerance_deg: float | None,
 ) -> None:
     """Record how far the arm was from the start pose when an episode began.
 
@@ -261,11 +276,11 @@ def _log_start_pose_deviation(
 
     worst = max(deviation, key=deviation.get)
     logging.info(
-        "Episode %d start pose: worst %s=%.1fdeg (tolerance %.1fdeg, outcome=%s).",
+        "Episode %d start pose: worst %s=%.1fdeg (tolerance %s, outcome=%s).",
         episode_index,
         worst,
         deviation[worst],
-        tolerance_deg,
+        f"{tolerance_deg:.1f}deg" if tolerance_deg is not None else "not checked",
         outcome,
     )
     if not path:
@@ -524,27 +539,43 @@ def record(
 
         # The pose right after connect is the start pose: the robot's startup
         # alignment has just run, so this is the "correct" pose every episode
-        # should begin from. Captured once and reused as the per-episode gate
-        # target — the same thing lerobot-rollout does via its initial_position.
+        # should begin from. Captured once and reused as the target every episode
+        # returns to — the same thing lerobot-rollout does via its initial_position.
         start_pose: dict[str, float] = {}
-        if cfg.start_pose_tolerance_deg is not None:
+        verify_pose: dict[str, float] = {}
+        if cfg.start_pose_tolerance_deg is not None or cfg.episode_advance == "manual":
+            # Every joint, gripper included: this is what the arms are returned to,
+            # and it has to match what lerobot-rollout returns to between inference
+            # episodes (which covers the full .pos set) or collection and inference
+            # would start from different states.
             start_pose = {
-                k: v
-                for k, v in robot.get_observation().items()
-                if k.endswith(".pos")
-                and v is not None
-                and (cfg.start_pose_gate_gripper or "gripper" not in k)
+                k: v for k, v in robot.get_observation().items() if k.endswith(".pos") and v is not None
+            }
+            # The gripper is returned but not judged by default: what it reads at
+            # the end of an episode legitimately depends on what was grasped.
+            verify_pose = {
+                k: v for k, v in start_pose.items() if cfg.start_pose_gate_gripper or "gripper" not in k
             }
             if start_pose:
                 logging.info(
-                    "Start-pose gate active (tolerance %.1fdeg) on %d joints: %s",
-                    cfg.start_pose_tolerance_deg,
+                    "Start pose captured on %d joints, %d checked (advance=%s, tolerance=%s): %s",
                     len(start_pose),
+                    len(verify_pose),
+                    cfg.episode_advance,
+                    f"{cfg.start_pose_tolerance_deg:.1f}deg"
+                    if cfg.start_pose_tolerance_deg is not None
+                    else "not checked",
                     ", ".join(f"{k}={v:.1f}" for k, v in sorted(start_pose.items())),
                 )
+                if cfg.episode_advance == "manual":
+                    logging.info(
+                        "Manual episode advance: after each episode press 'a' to return both arms to "
+                        "the start pose, restore the scene, then press the right arrow to start the "
+                        "next episode (left arrow re-records, esc stops)."
+                    )
             else:
                 logging.warning(
-                    "Start-pose gate requested but the robot reported no usable joint positions; "
+                    "Start-pose handling requested but the robot reported no usable joint positions; "
                     "recording without it."
                 )
 
@@ -575,12 +606,54 @@ def record(
 
         with VideoEncodingManager(dataset):
             recorded_episodes = 0
+            # Start-pose result carried over from the manual cue, logged at the top
+            # of the next iteration where the episode index it belongs to is known
+            # (a re-record reuses the same index).
+            pending_start_pose: tuple[dict[str, float], str] | None = None
+            # Set after a discarded take in manual mode: the retake needs the arm
+            # returned again, and the cue for it has to run before recording.
+            cue_before_next_record = False
             while recorded_episodes < cfg.dataset.num_episodes and not events["stop_recording"]:
-                if start_pose:
+                if pending_start_pose is not None:
+                    _log_start_pose_deviation(
+                        cfg.start_pose_log_path,
+                        dataset.num_episodes,
+                        *pending_start_pose,
+                        cfg.start_pose_tolerance_deg,
+                    )
+                    pending_start_pose = None
+
+                if cue_before_next_record and start_pose:
+                    cue_before_next_record = False
+                    deviation, outcome = wait_for_episode_cue(
+                        robot=robot,
+                        events=events,
+                        target_pos=start_pose,
+                        verify_pos=verify_pose,
+                        teleop=teleop,
+                        teleop_slice=start_pose_teleop_slice,
+                        verify_deg=cfg.start_pose_tolerance_deg,
+                        play_sounds=cfg.play_sounds,
+                    )
+                    _log_start_pose_deviation(
+                        cfg.start_pose_log_path,
+                        dataset.num_episodes,
+                        deviation,
+                        outcome,
+                        cfg.start_pose_tolerance_deg,
+                    )
+                    if outcome == "stopped":
+                        break
+                    if outcome == "rerecord":
+                        # Nothing has been recorded yet to discard.
+                        events["rerecord_episode"] = False
+
+                if start_pose and cfg.episode_advance == "auto":
                     deviation, outcome = wait_for_start_pose(
                         robot=robot,
                         events=events,
                         target_pos=start_pose,
+                        verify_pos=verify_pose,
                         tolerance_deg=cfg.start_pose_tolerance_deg,
                         teleop=teleop,
                         teleop_slice=start_pose_teleop_slice,
@@ -613,11 +686,36 @@ def record(
                     display_compressed_images=display_compressed_images,
                 )
 
+                is_last_episode = recorded_episodes >= cfg.dataset.num_episodes - 1
+                if cfg.episode_advance == "manual" and start_pose:
+                    # The operator owns the boundary: 'a' returns the arms (which
+                    # clears the workspace before anything is placed in it), then
+                    # the right arrow starts the next episode. Skipped after the
+                    # final episode, where there is no next one to set up.
+                    if not events["stop_recording"] and (not is_last_episode or events["rerecord_episode"]):
+                        pending_start_pose = wait_for_episode_cue(
+                            robot=robot,
+                            events=events,
+                            target_pos=start_pose,
+                            verify_pos=verify_pose,
+                            teleop=teleop,
+                            teleop_slice=start_pose_teleop_slice,
+                            verify_deg=cfg.start_pose_tolerance_deg,
+                            play_sounds=cfg.play_sounds,
+                        )
+                        if pending_start_pose[1] == "stopped":
+                            # Fall through so the episode just recorded is still
+                            # saved; the while condition ends the run.
+                            pending_start_pose = None
+                        elif pending_start_pose[1] == "rerecord":
+                            # The handler below discards the take. The arm still
+                            # has to be returned before the retake, so ask for the
+                            # cue again at the top of the loop.
+                            pending_start_pose = None
+                            cue_before_next_record = True
                 # Execute a few seconds without recording to give time to manually reset the environment
                 # Skip reset for the last episode to be recorded
-                if not events["stop_recording"] and (
-                    (recorded_episodes < cfg.dataset.num_episodes - 1) or events["rerecord_episode"]
-                ):
+                elif not events["stop_recording"] and (not is_last_episode or events["rerecord_episode"]):
                     log_say("Reset the environment", cfg.play_sounds)
 
                     record_loop(
