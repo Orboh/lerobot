@@ -86,9 +86,11 @@ lerobot-record \\
 ```
 """
 
+import json
 import logging
 import time
 from dataclasses import asdict, dataclass
+from pathlib import Path
 from pprint import pformat
 
 from lerobot.cameras import CameraConfig  # noqa: F401
@@ -100,6 +102,7 @@ from lerobot.common.control_utils import (
     init_keyboard_listener,
     is_headless,
     sanity_check_dataset_robot_compatibility,
+    wait_for_start_pose,
 )
 from lerobot.configs import parser
 from lerobot.configs.dataset import DatasetRecordConfig
@@ -180,6 +183,29 @@ class RecordConfig:
     play_sounds: bool = True
     # Resume recording on an existing dataset.
     resume: bool = False
+    # Per-episode start-pose gate. None (default) disables it, preserving the
+    # plain manual reset. When set, an episode does not start until every gated
+    # joint is within this many degrees of the pose captured right after connect
+    # (i.e. after the robot's own startup alignment): the operator brings the arm
+    # back by hand, or presses 'a' to have the leader driven there. The right
+    # arrow records anyway, esc stops. Without this gate the startup alignment
+    # only fires once per session, so each episode starts from a slightly
+    # different pose (measured on OpenArm: a fifth to a quarter of the joint
+    # range on J1/J4/J6/J7). Keep literal percent signs out of these comments:
+    # draccus turns them into argparse help strings, and a stray percent sign
+    # there breaks --help for the whole CLI.
+
+    start_pose_tolerance_deg: float | None = None
+    # Stop waiting for the start pose after this long and record anyway, so an
+    # unattended session cannot block forever on the gate.
+    start_pose_max_wait_s: float = 120.0
+    # Also gate the gripper. Off by default: its value at episode end legitimately
+    # depends on what was grasped, and startup pins it to its calibration zero.
+    start_pose_gate_gripper: bool = False
+    # Append one JSON line per episode with the start-pose deviation to this file
+    # (the collection manifest). None disables the file; deviations are logged to
+    # the console either way.
+    start_pose_log_path: str | None = None
 
     def __post_init__(self):
         if self.teleop is None:
@@ -214,6 +240,54 @@ class RecordConfig:
                                V
                   ( Rerun Log / Loop Wait )
 """
+
+
+def _log_start_pose_deviation(
+    path: str | None,
+    episode_index: int,
+    deviation: dict[str, float],
+    outcome: str,
+    tolerance_deg: float,
+) -> None:
+    """Record how far the arm was from the start pose when an episode began.
+
+    Always logs a one-line summary; also appends a JSON line to ``path`` when
+    given, so the per-episode start pose can be audited after the fact instead of
+    being reconstructed from the recorded frames (which is how the 19-28% start
+    scatter went unnoticed across 25 episodes).
+    """
+    if not deviation:
+        return
+
+    worst = max(deviation, key=deviation.get)
+    logging.info(
+        "Episode %d start pose: worst %s=%.1fdeg (tolerance %.1fdeg, outcome=%s).",
+        episode_index,
+        worst,
+        deviation[worst],
+        tolerance_deg,
+        outcome,
+    )
+    if not path:
+        return
+
+    entry = {
+        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "episode_index": episode_index,
+        "outcome": outcome,
+        "tolerance_deg": tolerance_deg,
+        "worst_joint": worst,
+        "worst_deviation_deg": round(deviation[worst], 3),
+        "deviation_deg": {k: round(v, 3) for k, v in sorted(deviation.items())},
+    }
+    try:
+        log_path = Path(path).expanduser()
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        with log_path.open("a") as f:
+            f.write(json.dumps(entry) + "\n")
+    except Exception as e:
+        # A failed audit log must never abort a recording session.
+        logging.warning("Could not append the start-pose log to %s: %s", path, e)
 
 
 @safe_stop_image_writer
@@ -448,9 +522,81 @@ def record(
                 "Streaming encoding is disabled. If you have capable hardware, consider enabling it for way faster episode saving. --dataset.streaming_encoding=true --dataset.encoder_threads=2 # --dataset.camera_encoder.vcodec=auto. More info in the documentation: https://huggingface.co/docs/lerobot/streaming_video_encoding"
             )
 
+        # The pose right after connect is the start pose: the robot's startup
+        # alignment has just run, so this is the "correct" pose every episode
+        # should begin from. Captured once and reused as the per-episode gate
+        # target — the same thing lerobot-rollout does via its initial_position.
+        start_pose: dict[str, float] = {}
+        if cfg.start_pose_tolerance_deg is not None:
+            start_pose = {
+                k: v
+                for k, v in robot.get_observation().items()
+                if k.endswith(".pos")
+                and v is not None
+                and (cfg.start_pose_gate_gripper or "gripper" not in k)
+            }
+            if start_pose:
+                logging.info(
+                    "Start-pose gate active (tolerance %.1fdeg) on %d joints: %s",
+                    cfg.start_pose_tolerance_deg,
+                    len(start_pose),
+                    ", ".join(f"{k}={v:.1f}" for k, v in sorted(start_pose.items())),
+                )
+            else:
+                logging.warning(
+                    "Start-pose gate requested but the robot reported no usable joint positions; "
+                    "recording without it."
+                )
+
+        def start_pose_teleop_slice(seconds: float) -> None:
+            """Run the plain teleop loop briefly so the follower tracks the leader.
+
+            Uses a private events dict: ``record_loop`` consumes ``exit_early``
+            when it breaks, which would swallow the operator's right-arrow
+            override before the gate could see it on the shared dict.
+            """
+            record_loop(
+                robot=robot,
+                events={
+                    "exit_early": False,
+                    "rerecord_episode": False,
+                    "stop_recording": False,
+                    "align_start_pose": False,
+                },
+                fps=cfg.dataset.fps,
+                teleop_action_processor=teleop_action_processor,
+                robot_action_processor=robot_action_processor,
+                robot_observation_processor=robot_observation_processor,
+                teleop=teleop,
+                control_time_s=seconds,
+                single_task=cfg.dataset.single_task,
+                display_data=cfg.display_data,
+            )
+
         with VideoEncodingManager(dataset):
             recorded_episodes = 0
             while recorded_episodes < cfg.dataset.num_episodes and not events["stop_recording"]:
+                if start_pose:
+                    deviation, outcome = wait_for_start_pose(
+                        robot=robot,
+                        events=events,
+                        target_pos=start_pose,
+                        tolerance_deg=cfg.start_pose_tolerance_deg,
+                        teleop=teleop,
+                        teleop_slice=start_pose_teleop_slice,
+                        max_wait_s=cfg.start_pose_max_wait_s,
+                        play_sounds=cfg.play_sounds,
+                    )
+                    _log_start_pose_deviation(
+                        cfg.start_pose_log_path,
+                        dataset.num_episodes,
+                        deviation,
+                        outcome,
+                        cfg.start_pose_tolerance_deg,
+                    )
+                    if outcome == "stopped":
+                        break
+
                 log_say(f"Recording episode {dataset.num_episodes}", cfg.play_sounds)
                 record_loop(
                     robot=robot,

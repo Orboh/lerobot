@@ -150,7 +150,7 @@ def _init_stdin_key_listener(events):
     display is available we instead put the terminal into cbreak mode and read the
     arrow keys / esc directly from stdin in a background thread, setting the same
     ``events`` flags as the pynput path (right arrow = next episode, left arrow =
-    rerecord last episode, esc = stop recording).
+    rerecord last episode, esc = stop recording, 'a' = align to the start pose).
 
     Returns an object exposing ``start()`` / ``stop()`` (mirroring pynput's Listener),
     or ``None`` when stdin is not an interactive TTY or termios is unavailable (e.g.
@@ -197,6 +197,11 @@ def _init_stdin_key_listener(events):
                         continue
                     ch = os.read(fd, 1)
                     if ch != b"\x1b":
+                        # Plain (non-escape) keys: only 'a' is bound, to request a
+                        # start-pose alignment while the recording gate is waiting.
+                        if ch in (b"a", b"A"):
+                            print("'a' key pressed. Aligning the arm to the start pose...")
+                            events["align_start_pose"] = True
                         continue
                     seq = b"\x1b"
                     # Grab the rest of an escape sequence if it arrived in the same burst.
@@ -236,8 +241,9 @@ def init_keyboard_listener():
     """
     Initializes a non-blocking keyboard listener for real-time user interaction.
 
-    This function sets up a listener for specific keys (right arrow, left arrow, escape) to control
-    the program flow during execution, such as stopping recording or exiting loops.
+    This function sets up a listener for specific keys (right arrow, left arrow, escape, 'a') to
+    control the program flow during execution, such as stopping recording, exiting loops, or
+    requesting a start-pose alignment while the recording start-pose gate is waiting.
 
     When a graphical display is available it uses ``pynput``. On Linux without a display
     (e.g. a plain SSH session) pynput cannot receive key events, so it falls back to reading
@@ -258,6 +264,7 @@ def init_keyboard_listener():
     events["exit_early"] = False
     events["rerecord_episode"] = False
     events["stop_recording"] = False
+    events["align_start_pose"] = False
 
     import os
     import sys
@@ -282,7 +289,7 @@ def init_keyboard_listener():
         else:
             logging.info(
                 "No display detected: reading recording control keys from stdin "
-                "(right arrow = next, left arrow = rerecord, esc = stop). "
+                "(right arrow = next, left arrow = rerecord, esc = stop, a = align to start pose). "
                 "On-screen camera display will not be available."
             )
         return listener, events
@@ -303,6 +310,9 @@ def init_keyboard_listener():
                 print("Escape key pressed. Stopping data recording...")
                 events["stop_recording"] = True
                 events["exit_early"] = True
+            elif key == keyboard.KeyCode.from_char("a"):
+                print("'a' key pressed. Aligning the arm to the start pose...")
+                events["align_start_pose"] = True
         except Exception as e:
             print(f"Error handling key press: {e}")
 
@@ -429,6 +439,183 @@ def teleop_smooth_move_to(teleop, target_pos: dict, duration_s: float = 2.0, fps
         }
         teleop.send_feedback(interp)
         time.sleep(1 / fps)
+
+
+def teleop_can_be_driven(teleop) -> bool:
+    """Return True when the teleop may be driven to a target pose by software.
+
+    Stricter than :func:`teleop_supports_feedback`: a teleop configured for
+    torque-off manual control (e.g. OpenArm leader with ``manual_control=True``)
+    is mechanically drivable but must not be driven, because enabling torque to
+    move it leaves it stiff afterwards and the operator can no longer move it by
+    hand. Gravity-compensation mode is fine — the teleop loop re-injects the
+    gravity feed-forward on the next ``get_action()`` and the arm goes weightless
+    again on its own.
+    """
+    if not teleop_supports_feedback(teleop):
+        return False
+    return not getattr(teleop.config, "manual_control", False)
+
+
+def start_pose_deviation(current_pos: dict, target_pos: dict) -> dict[str, float]:
+    """Absolute per-joint deviation (deg) between the current pose and a start pose.
+
+    Both dicts are in the observation/action key space (``<motor>.pos``). Keys
+    absent from either side are skipped, so a partial ``target_pos`` gates only
+    on the joints it names.
+    """
+    return {
+        k: abs(float(current_pos[k]) - float(target_pos[k]))
+        for k in target_pos
+        if k in current_pos and current_pos[k] is not None and target_pos[k] is not None
+    }
+
+
+def wait_for_start_pose(
+    robot,
+    events: dict,
+    target_pos: dict,
+    tolerance_deg: float,
+    teleop=None,
+    teleop_slice=None,
+    slice_s: float = 2.0,
+    max_wait_s: float = 120.0,
+    play_sounds: bool = True,
+) -> tuple[dict[str, float], str]:
+    """Block until the robot's pose is within ``tolerance_deg`` of ``target_pos``.
+
+    Data-collection quality gate. The startup alignment only fires once per
+    session, so with a manual per-episode reset every episode starts from a
+    slightly different pose — measured on OpenArm, 19-28% of the joint range on
+    J1/J4/J6/J7. Trained on few episodes, a policy then regresses toward the mean
+    start pose instead of learning the task, so this gate refuses to begin an
+    episode until the arm is back at the pose captured at connect time.
+
+    The arm is never moved on its own: pressing 'a' drives the leader to
+    ``target_pos`` (only when :func:`teleop_can_be_driven`), otherwise the
+    operator moves it by hand. ``teleop_slice`` runs ``slice_s`` seconds of the
+    normal teleop loop between checks so the follower keeps tracking the leader
+    while the operator adjusts — without it the follower would not move at all
+    while the gate waits.
+
+    Returns ``(deviation, outcome)`` with outcome one of ``"within"`` (passed),
+    ``"override"`` (operator skipped it with the right arrow), ``"timeout"``, or
+    ``"stopped"`` (esc).
+    """
+    from lerobot.utils.utils import log_say
+
+    deadline = time.perf_counter() + max_wait_s
+    announced = False
+
+    if events.get("align_start_pose"):
+        # Pressed before the gate opened (e.g. during the reset window, where
+        # nothing consumes it). Honouring it here would start an autonomous move
+        # seconds after the keypress, while the operator may still be reaching
+        # into the workspace. Require a fresh press instead.
+        events["align_start_pose"] = False
+        logging.info(
+            "Start-pose gate: discarding an alignment request made before the gate opened; "
+            "press 'a' again once clear of both arms."
+        )
+
+    while True:
+        if events.get("rerecord_episode"):
+            # No episode is in progress while the gate waits, so a rerecord
+            # request has nothing to act on. Drop it here: left arrow also sets
+            # exit_early, and leaving the flag set would make the caller record
+            # the next episode and then discard it.
+            events["rerecord_episode"] = False
+            logging.info("Start-pose gate: ignoring rerecord request (no episode in progress).")
+
+        obs = robot.get_observation()
+        current_pos = {k: v for k, v in obs.items() if k.endswith(".pos")}
+        deviation = start_pose_deviation(current_pos, target_pos)
+
+        if not deviation:
+            logging.warning(
+                "Start-pose gate: no joints in common between the observation and the start pose; skipping."
+            )
+            return deviation, "within"
+
+        worst = max(deviation, key=deviation.get)
+        if deviation[worst] <= tolerance_deg:
+            if announced:
+                logging.info(
+                    "Start-pose gate cleared (worst %s=%.1fdeg <= %.1fdeg).",
+                    worst,
+                    deviation[worst],
+                    tolerance_deg,
+                )
+            return deviation, "within"
+
+        if events.get("stop_recording"):
+            return deviation, "stopped"
+
+        if events.get("exit_early"):
+            # Right arrow while the gate waits = record from here anyway.
+            events["exit_early"] = False
+            logging.warning(
+                "Start-pose gate overridden by the operator (worst %s=%.1fdeg > %.1fdeg).",
+                worst,
+                deviation[worst],
+                tolerance_deg,
+            )
+            return deviation, "override"
+
+        if not announced:
+            log_say("Return the arm to the start pose", play_sounds)
+            announced = True
+
+        offenders = ", ".join(
+            f"{k}={deviation[k]:.1f}deg"
+            for k in sorted(deviation, key=deviation.get, reverse=True)
+            if deviation[k] > tolerance_deg
+        )
+        logging.info(
+            "Start-pose gate: waiting (tolerance %.1fdeg). Off by %s. "
+            "Press 'a' to align, right arrow to record anyway, esc to stop.",
+            tolerance_deg,
+            offenders,
+        )
+
+        if events.get("align_start_pose"):
+            events["align_start_pose"] = False
+            if teleop is not None and teleop_can_be_driven(teleop):
+                logging.info("Start-pose gate: driving the teleop to the start pose.")
+                # Torque is deliberately left on: a gravity-compensated leader
+                # goes weightless again on the next get_action(), while
+                # disabling it here would drop the arm under its own weight.
+                teleop_smooth_move_to(teleop, target_pos, duration_s=2.0)
+                # Walk the follower over as well, in the same order the teleop
+                # loop would: leader first, then follower. Without this the
+                # follower sits still while the leader moves, and the first
+                # tracking cycle after the gate commands it straight to the new
+                # pose in one step — there is no rate limit on that path unless
+                # max_relative_target is set (it defaults to None).
+                current_pos = {k: v for k, v in robot.get_observation().items() if k in target_pos}
+                if current_pos:
+                    follower_smooth_move_to(robot, current_pos, target_pos, duration_s=1.5)
+            else:
+                logging.warning(
+                    "Start-pose gate: this teleop must not be driven by software; move the arm by hand."
+                )
+
+        if time.perf_counter() > deadline:
+            logging.warning(
+                "Start-pose gate timed out after %.0fs (worst %s=%.1fdeg > %.1fdeg). Recording anyway.",
+                max_wait_s,
+                worst,
+                deviation[worst],
+                tolerance_deg,
+            )
+            return deviation, "timeout"
+
+        if teleop_slice is not None:
+            # Run the real teleop loop so the follower tracks the leader as the
+            # operator (or the alignment above) brings it back to the start pose.
+            teleop_slice(slice_s)
+        else:
+            time.sleep(min(slice_s, 0.5))
 
 
 def follower_smooth_move_to(
