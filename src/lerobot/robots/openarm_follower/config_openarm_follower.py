@@ -76,6 +76,30 @@ class OpenArmFollowerConfigBase:
     # Set to a positive scalar for all motors, or a dict mapping motor names to limits
     max_relative_target: float | dict[str, float] | None = None
 
+    # --- Calibration anchor ----------------------------------------------------
+    # How calibrate() establishes the persistent software zero:
+    #   "hang_down" (default): operator hangs the arm straight down and the raw
+    #     readings at that pose become the homing offsets (accuracy limited by
+    #     how reproducibly a human can hang the arm).
+    #   "bump_to_stop": the arm actively sweeps each ARM joint (never the
+    #     gripper) into its mechanical hard stop and anchors the zero to the
+    #     known stop angles (highest confidence, no jig needed). OPT-IN: the
+    #     arm moves by itself during calibration — clear the workspace. The
+    #     gripper zero must be flash-burned by hand at the closed pose first
+    #     (openarm_gripper_zero.py). Requires config.side to be set.
+    calibration_anchor: str = "hang_down"
+
+    # Per-unit overrides for the bump-to-stop anchor (all optional; defaults in
+    # lerobot.motors.damiao.damiao_bump_calibration are the official openarm_can
+    # values and WILL need tuning per unit on the real arms):
+    #   bump_stop_angles_deg: measured mechanical stop angles in the URDF frame
+    #     (e.g. {"joint_1": -78.5}) when a unit's stop deviates from the nominal.
+    #   bump_torque_thresholds_nm / bump_velocity_thresholds_deg_s: per-joint
+    #     stop-contact detection thresholds (|tau| above / |vel| below).
+    bump_stop_angles_deg: dict[str, float] | None = None
+    bump_torque_thresholds_nm: dict[str, float] | None = None
+    bump_velocity_thresholds_deg_s: dict[str, float] | None = None
+
     # --- Persistent zero (software homing offsets) ----------------------------
     # Whether connect() burns a new motor-side zero (Damiao 0xFE) at the current
     # physical pose.

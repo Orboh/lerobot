@@ -60,6 +60,22 @@ class OpenArmLeaderConfigBase:
     # When enabled, motors have torque disabled for manual movement
     manual_control: bool = True
 
+    # --- Calibration anchor ----------------------------------------------------
+    # Same semantics as OpenArmFollowerConfigBase.calibration_anchor:
+    #   "hang_down" (default) captures the zero at the hand-positioned hang-down
+    #   pose; "bump_to_stop" sweeps each ARM joint (never the gripper) into its
+    #   mechanical hard stop and anchors the zero there (opt-in, the arm moves
+    #   by itself). The leader has no `side` field: the bump sequence side is
+    #   taken from `gravity_side` — set it explicitly when using bump_to_stop.
+    calibration_anchor: str = "hang_down"
+
+    # Per-unit bump-to-stop overrides (see OpenArmFollowerConfigBase for the
+    # full note; defaults live in lerobot.motors.damiao.damiao_bump_calibration
+    # and need per-unit tuning on the real arms).
+    bump_stop_angles_deg: dict[str, float] | None = None
+    bump_torque_thresholds_nm: dict[str, float] | None = None
+    bump_velocity_thresholds_deg_s: dict[str, float] | None = None
+
     # --- Persistent zero (software homing offsets) ----------------------------
     # Same semantics as OpenArmFollowerConfigBase.rezero_on_connect:
     #   None (auto): legacy calibrations (offsets all zero) keep the historical

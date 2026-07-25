@@ -28,6 +28,7 @@ from lerobot.motors.damiao.damiao_alignment import (
     should_rezero_on_connect,
     soft_move_to_position,
 )
+from lerobot.motors.damiao.damiao_bump_calibration import run_bump_to_stop_calibration
 from lerobot.types import RobotAction
 from lerobot.utils.decorators import check_if_already_connected, check_if_not_connected
 
@@ -198,7 +199,10 @@ class OpenArmLeader(Teleoperator):
         """
         Run calibration procedure for OpenArms leader (persistent software zero).
 
-        The calibration procedure:
+        Two anchor modes (config.calibration_anchor), same semantics as
+        OpenArmFollower.calibrate:
+
+        "hang_down" (default):
         1. Disable torque (if not already disabled)
         2. Ask user to position the arm hanging straight down, gripper closed
         3. Read the motors' NATIVE positions at that reference and store them as
@@ -206,7 +210,19 @@ class OpenArmLeader(Teleoperator):
            hang-down = URDF zero). The motor-side zero (Damiao 0xFE) is
            intentionally NOT burned — see OpenArmFollower.calibrate for why.
         4. Save calibration (with the fixed ±90° default range)
+
+        "bump_to_stop" (opt-in): sweep each ARM joint into its mechanical hard
+        stop and anchor the zero there (offset = raw_at_stop - stop_angle);
+        gripper never bumped, offset pinned to 0 (hand flash-zero it first with
+        openarm_gripper_zero.py). The sequence side comes from
+        config.gravity_side — set it explicitly. See
+        lerobot.motors.damiao.damiao_bump_calibration.
         """
+        if self.config.calibration_anchor not in ("hang_down", "bump_to_stop"):
+            raise ValueError(
+                f"calibration_anchor must be 'hang_down' or 'bump_to_stop', "
+                f"got {self.config.calibration_anchor!r}"
+            )
         if self.calibration:
             # Calibration file exists, ask user whether to use it or run new calibration
             user_input = input(
@@ -218,31 +234,50 @@ class OpenArmLeader(Teleoperator):
                 return
 
         logger.info(f"\nRunning calibration for {self}")
-        self.bus.disable_torque()
 
-        # Step 1: capture the reference pose (software homing offsets)
-        input(
-            "\nCalibration: capture reference (persistent software zero)\n"
-            "If a motor-side zero was ever written this session, POWER-CYCLE the arm first\n"
-            "(so the captured offsets reference the persistent boot frame).\n"
-            "Position the arm in the following configuration:\n"
-            "  - Arm hanging straight down\n"
-            "  - Gripper closed\n"
-            "Press ENTER when ready..."
-        )
-
-        raw_positions = self.bus.read_raw_positions()
-        missing = [motor for motor in self.bus.motors if motor not in raw_positions]
-        if missing:
-            raise RuntimeError(
-                f"Calibration aborted: no position response from {missing}. "
-                "Check CAN wiring / motor power and retry."
+        if self.config.calibration_anchor == "bump_to_stop":
+            if self.config.gravity_side not in ("left", "right"):
+                raise ValueError(
+                    "calibration_anchor='bump_to_stop' requires gravity_side='left' or 'right' "
+                    "(the bump sequence and stop angles are side-specific)."
+                )
+            homing_offsets = run_bump_to_stop_calibration(
+                self.bus,
+                side=self.config.gravity_side,
+                joint_limits=self._side_joint_limits(),
+                stop_angles_override=self.config.bump_stop_angles_deg,
+                torque_thresholds_nm=self.config.bump_torque_thresholds_nm,
+                velocity_thresholds_deg_s=self.config.bump_velocity_thresholds_deg_s,
+                label=str(self),
             )
+        else:
+            self.bus.disable_torque()
+
+            # Step 1: capture the reference pose (software homing offsets)
+            input(
+                "\nCalibration: capture reference (persistent software zero)\n"
+                "If a motor-side zero was ever written this session, POWER-CYCLE the arm first\n"
+                "(so the captured offsets reference the persistent boot frame).\n"
+                "Position the arm in the following configuration:\n"
+                "  - Arm hanging straight down\n"
+                "  - Gripper closed\n"
+                "Press ENTER when ready..."
+            )
+
+            raw_positions = self.bus.read_raw_positions()
+            missing = [motor for motor in self.bus.motors if motor not in raw_positions]
+            if missing:
+                raise RuntimeError(
+                    f"Calibration aborted: no position response from {missing}. "
+                    "Check CAN wiring / motor power and retry."
+                )
+            homing_offsets = raw_positions
+
         logger.info(
             "Captured homing offsets (deg): "
-            + ", ".join(f"{m}={v:.2f}" for m, v in raw_positions.items())
+            + ", ".join(f"{m}={v:.2f}" for m, v in homing_offsets.items())
         )
-        for motor_name, offset in raw_positions.items():
+        for motor_name, offset in homing_offsets.items():
             if abs(offset) > 120.0:
                 logger.warning(
                     f"{motor_name}: homing offset {offset:.1f} deg is close to the ±180 deg "
@@ -257,7 +292,7 @@ class OpenArmLeader(Teleoperator):
             self.calibration[motor_name] = MotorCalibration(
                 id=motor.id,
                 drive_mode=0,
-                homing_offset=raw_positions[motor_name],
+                homing_offset=homing_offsets[motor_name],
                 range_min=-90,
                 range_max=90,
             )
