@@ -257,6 +257,61 @@ class RecordConfig:
 """
 
 
+def _utc_now() -> str:
+    """UTC timestamp with an explicit Z.
+
+    The log is read on a different machine from the one that records (the run
+    directory is pulled to a Vault shared between machines), and sessions are
+    compared across days. A local naive timestamp cannot be ordered against
+    another machine's, and silently shifts under DST, so everything written here
+    is UTC and says so.
+    """
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def _write_start_pose_reference(
+    path: str | None,
+    target_pos: dict[str, float],
+    verify_pos: dict[str, float],
+    episode_advance: str,
+    tolerance_deg: float | None,
+    gate_gripper: bool,
+) -> None:
+    """Write the pose every deviation in this file is measured against.
+
+    Without it the log is a column of numbers with no stated origin: a reader
+    cannot tell whether "joint_4 = 7.4deg" means the arm was misplaced or the
+    reference itself moved (a re-calibration changes the reference). The console
+    dump has the pose, but the console is not what survives into the Vault.
+
+    Written as the first line of the file so an appended per-episode row never
+    has to carry it. Skipped if the file already exists, which keeps ``--resume``
+    from inserting a second reference mid-file.
+    """
+    if not path or not target_pos:
+        return
+    entry = {
+        "type": "start_pose_reference",
+        "timestamp": _utc_now(),
+        "episode_advance": episode_advance,
+        "tolerance_deg": tolerance_deg,
+        "gate_gripper": gate_gripper,
+        # Everything the arms are returned to, gripper included.
+        "target_pos": {k: round(v, 3) for k, v in sorted(target_pos.items())},
+        # The subset the deviations below are actually judged on.
+        "checked_joints": sorted(verify_pos),
+    }
+    try:
+        log_path = Path(path).expanduser()
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        if log_path.exists():
+            return
+        with log_path.open("a") as f:
+            f.write(json.dumps(entry) + "\n")
+    except Exception as e:
+        logging.warning("Could not write the start-pose reference to %s: %s", path, e)
+
+
 def _log_start_pose_deviation(
     path: str | None,
     episode_index: int,
@@ -287,7 +342,8 @@ def _log_start_pose_deviation(
         return
 
     entry = {
-        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "type": "episode",
+        "timestamp": _utc_now(),
         "episode_index": episode_index,
         "outcome": outcome,
         "tolerance_deg": tolerance_deg,
@@ -573,6 +629,16 @@ def record(
                         "the start pose, restore the scene, then press the right arrow to start the "
                         "next episode (left arrow re-records, esc stops)."
                     )
+                # Record what the per-episode deviations below are measured against,
+                # so the log stands on its own once it leaves this machine.
+                _write_start_pose_reference(
+                    cfg.start_pose_log_path,
+                    start_pose,
+                    verify_pose,
+                    cfg.episode_advance,
+                    cfg.start_pose_tolerance_deg,
+                    cfg.start_pose_gate_gripper,
+                )
             else:
                 logging.warning(
                     "Start-pose handling requested but the robot reported no usable joint positions; "
