@@ -623,14 +623,29 @@ def drive_to_start_pose(robot, teleop, target_pos: dict) -> bool:
     Returns False when the teleop must not be driven by software (a torque-off
     manual-control leader), in which case nothing is moved.
     """
-    if teleop is None or not teleop_can_be_driven(teleop):
+    if teleop is None:
+        logging.warning("Start pose: no teleoperator to drive; move the arm by hand instead.")
+        return False
+
+    if hasattr(teleop, "soft_move_to"):
+        # Teleops that drive themselves on their own bus (OpenArm leader: MIT
+        # position commands with gravity feed-forward, the same primitive as its
+        # connect-time alignment). The generic path below goes through
+        # send_feedback, which OpenArm raises NotImplementedError for, so asking
+        # the teleop to move itself is the only way it can be returned at all.
+        logging.info("Start pose: driving the leader back to the start pose.")
+        if not teleop.soft_move_to(
+            {k.removesuffix(".pos"): v for k, v in target_pos.items()}, duration_s=2.0
+        ):
+            return False
+    elif teleop_can_be_driven(teleop):
+        logging.info("Start pose: driving the leader back to the start pose.")
+        teleop_smooth_move_to(teleop, target_pos, duration_s=2.0)
+    else:
         logging.warning(
             "Start pose: this teleop must not be driven by software; move the arm by hand instead."
         )
         return False
-
-    logging.info("Start pose: driving the leader back to the start pose.")
-    teleop_smooth_move_to(teleop, target_pos, duration_s=2.0)
 
     current_pos = {k: v for k, v in robot.get_observation().items() if k in target_pos}
     if current_pos:

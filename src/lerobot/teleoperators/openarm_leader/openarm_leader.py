@@ -195,6 +195,38 @@ class OpenArmLeader(Teleoperator):
             else LEFT_DEFAULT_JOINTS_LIMITS
         )
 
+    def soft_move_to(self, pose_deg: dict[str, float], duration_s: float = 2.0) -> bool:
+        """Softly drive the leader to ``pose_deg`` on its own bus.
+
+        Same primitive as the connect-time alignment: MIT position commands with
+        the soft AdjustPosition gains, plus the gravity feed-forward in gravity
+        mode so a raised pose is actually reached instead of sagging short of it.
+        Exists because the generic teleop drive path goes through
+        ``send_feedback``, which OpenArm does not implement — without this the
+        per-episode start-pose return silently does nothing.
+
+        Torque is deliberately left on afterwards: the teleop loop's next gravity
+        injection makes the arm weightless again, whereas disabling torque here
+        would drop it under its own weight.
+
+        Returns False when the leader is not under torque (pure manual_control),
+        where driving it would leave it stiff and unusable for teleoperation.
+        """
+        if not (self.config.gravity_compensation or not self.config.manual_control):
+            logger.warning(
+                "soft_move_to: leader runs in torque-off manual_control; refusing to drive it "
+                "(enabling torque here would leave the arm stiff). Move it by hand instead."
+            )
+            return False
+
+        goal = resolve_initial_pose(
+            initial_pose_deg=pose_deg,
+            joint_limits=self._side_joint_limits(),
+        )
+        torque_ff_fn = self._gravity_tau_from_positions if self.config.gravity_compensation else None
+        soft_move_to_position(self.bus, goal, duration_s, torque_ff_fn=torque_ff_fn)
+        return True
+
     def calibrate(self) -> None:
         """
         Run calibration procedure for OpenArms leader (persistent software zero).
