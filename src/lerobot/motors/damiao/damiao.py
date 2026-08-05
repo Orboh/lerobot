@@ -61,6 +61,7 @@ logger = logging.getLogger(__name__)
 
 LONG_TIMEOUT_SEC = 0.1
 MEDIUM_TIMEOUT_SEC = 0.01
+RETRY_TIMEOUT_SEC = 0.003
 SHORT_TIMEOUT_SEC = 0.001
 PRECISE_TIMEOUT_SEC = 0.0001
 
@@ -151,6 +152,45 @@ class DamiaoMotorsBus(MotorsBusBase):
         # Defaults: Kp=10.0 (Stiffness), Kd=0.5 (Damping)
         self._gains: dict[str, dict[str, float]] = {name: {"kp": 10.0, "kd": 0.5} for name in self.motors}
 
+        # Batch-refresh bookkeeping (see _batch_refresh): re-request budget for
+        # motors that miss a collection window, per-motor consecutive-miss
+        # counters for the give-up latch, and aggregated drop/recovery counters
+        # flushed by _maybe_log_refresh_stats at most once per second (per-cycle
+        # warnings over an ssh console are themselves a control-loop hazard).
+        self.refresh_num_retry: int = 2
+        self.refresh_giveup_after: int = 3
+        self.refresh_rearm_after: int = 100
+        self._consecutive_drops: dict[str, int] = dict.fromkeys(self.motors, 0)
+        self._consecutive_ok: dict[str, int] = dict.fromkeys(self.motors, 0)
+        self._last_update_ts: dict[str, float] = dict.fromkeys(self.motors, 0.0)
+        self._refresh_drop_counts: dict[str, int] = {}
+        self._refresh_recovered: int = 0
+        self._refresh_stale_drained: int = 0
+        self._refresh_fresh_via_drain: int = 0
+        self._refresh_age_max: float = 0.0
+        self._refresh_cycles: int = 0
+        self._refresh_time_sum: float = 0.0
+        self._refresh_time_max: float = 0.0
+        self._refresh_last_log: float = time.monotonic()
+
+        # Software homing offsets in DEGREES, loaded from the calibration file.
+        # Damiao motors cannot persist a calibration internally and the 0xFE
+        # "set zero" command's flash persistence is firmware-dependent, so the
+        # repeatable zero lives HERE: positions decoded from the bus are in the
+        # motor's native frame ("raw"); every read SUBTRACTS the offset and every
+        # MIT position command ADDS it back, so all callers work in a stable
+        # logical frame whose zero is the calibration reference pose (arm hanging
+        # straight down = URDF zero). Legacy calibrations carry offset 0, making
+        # the transform an exact no-op.
+        self._homing_offsets: dict[str, float] = dict.fromkeys(self.motors, 0.0)
+        self._refresh_homing_offsets()
+
+    def _refresh_homing_offsets(self) -> None:
+        """Rebuild the raw<->logical position offsets from the cached calibration."""
+        for name in self.motors:
+            cal = self.calibration.get(name) if self.calibration else None
+            self._homing_offsets[name] = float(cal.homing_offset) if cal is not None else 0.0
+
     @property
     def is_connected(self) -> bool:
         """Check if the CAN bus is connected."""
@@ -237,7 +277,10 @@ class DamiaoMotorsBus(MotorsBusBase):
             if response is None:
                 missing_motors.append(motor_name)
             else:
-                self._process_response(motor_name, msg)
+                # NOTE: must decode the motor's RESPONSE, not the enable command we
+                # sent (decoding the sent 0xFF.. payload used to seed the state
+                # cache with a garbage position of +position_max degrees).
+                self._process_response(motor_name, response)
             time.sleep(MEDIUM_TIMEOUT_SEC)
 
         if missing_motors:
@@ -333,9 +376,24 @@ class DamiaoMotorsBus(MotorsBusBase):
             self.enable_torque(motors)
 
     def set_zero_position(self, motors: str | list[str] | None = None) -> None:
-        """Set current position as zero for selected motors."""
+        """Set current position as zero for selected motors (Damiao 0xFE command).
+
+        This re-frames the motor's NATIVE zero, so any stored software homing
+        offset becomes stale and is cleared (in memory and in the cached
+        calibration — the calibration file on disk is NOT rewritten here; re-run
+        the calibration to restore persistent-zero mode).
+        """
         target_motors = self._get_motors_list(motors)
         for motor in target_motors:
+            if self._homing_offsets.get(motor, 0.0) != 0.0:
+                logger.warning(
+                    f"set_zero_position({motor}): burning a new motor zero clears the stored "
+                    f"homing offset ({self._homing_offsets[motor]:.2f} deg). Re-run calibration "
+                    "to restore the persistent software zero."
+                )
+            self._homing_offsets[motor] = 0.0
+            if self.calibration and motor in self.calibration:
+                self.calibration[motor].homing_offset = 0.0
             self._send_simple_command(motor, CAN_CMD_SET_ZERO)
             time.sleep(MEDIUM_TIMEOUT_SEC)
 
@@ -393,34 +451,42 @@ class DamiaoMotorsBus(MotorsBusBase):
         return None
 
     def _recv_all_responses(
-        self, expected_recv_ids: list[int], timeout: float = 0.002
+        self,
+        expected_recv_ids: list[int],
+        timeout: float = 0.002,
+        required_recv_ids: list[int] | None = None,
     ) -> dict[int, can.Message]:
         """
         Efficiently receive responses from multiple motors at once.
         Uses the OpenArms pattern: collect all available messages within timeout.
 
         Args:
-            expected_recv_ids: List of CAN IDs we expect responses from
+            expected_recv_ids: CAN IDs whose frames are accepted into the result
             timeout: Total timeout in seconds (default: 2ms)
+            required_recv_ids: IDs the window blocks on; defaults to all expected
+                IDs. The loop exits once every required ID has answered (or on
+                timeout). Frames from non-required expected IDs are still matched
+                if they arrive before the window closes — this lets callers keep
+                requesting a latched (unresponsive) motor without paying its
+                timeout every cycle.
 
         Returns:
             Dictionary mapping recv_id to CAN message
         """
         responses: dict[int, can.Message] = {}
         expected_set = set(expected_recv_ids)
+        required = set(required_recv_ids) if required_recv_ids is not None else set(expected_recv_ids)
         start_time = time.time()
 
         if self.canbus is None:
             raise RuntimeError("CAN bus is not initialized.")
 
         try:
-            while len(responses) < len(expected_recv_ids) and (time.time() - start_time) < timeout:
+            while not required.issubset(responses.keys()) and (time.time() - start_time) < timeout:
                 # 100us poll timeout
                 msg = self.canbus.recv(timeout=PRECISE_TIMEOUT_SEC)
                 if msg and msg.arbitration_id in expected_set:
                     responses[msg.arbitration_id] = msg
-                    if len(responses) == len(expected_recv_ids):
-                        break
         except Exception as e:
             logger.debug(f"Error receiving responses: {e}")
 
@@ -479,7 +545,10 @@ class DamiaoMotorsBus(MotorsBusBase):
         if self.canbus is None:
             raise RuntimeError("CAN bus is not initialized.")
 
-        data = self._encode_mit_packet(motor_type, kp, kd, position_degrees, velocity_deg_per_sec, torque)
+        # Positions are commanded in the logical (calibrated) frame; convert to
+        # the motor's native frame by adding the homing offset back.
+        raw_position = position_degrees + self._homing_offsets.get(motor_name, 0.0)
+        data = self._encode_mit_packet(motor_type, kp, kd, raw_position, velocity_deg_per_sec, torque)
         msg = can.Message(arbitration_id=motor_id, data=data, is_extended_id=False, is_fd=self.use_can_fd)
         self.canbus.send(msg)
 
@@ -504,10 +573,16 @@ class DamiaoMotorsBus(MotorsBusBase):
         if not commands:
             return
 
-        recv_id_to_motor: dict[int, str] = {}
-
         if self.canbus is None:
             raise RuntimeError("CAN bus is not initialized.")
+
+        recv_id_to_motor: dict[int, str] = {
+            self._get_motor_recv_id(motor): self._get_motor_name(motor) for motor in commands
+        }
+        # Leftover responses from a previous collection window would otherwise
+        # be matched below as acks of the commands sent in this cycle.
+        drained, _ = self._drain_pending_responses(recv_id_to_motor)
+        self._refresh_stale_drained += drained
 
         # Step 1: Send all MIT control commands
         for motor, (kp, kd, position_degrees, velocity_deg_per_sec, torque) in commands.items():
@@ -515,11 +590,11 @@ class DamiaoMotorsBus(MotorsBusBase):
             motor_name = self._get_motor_name(motor)
             motor_type = self._motor_types[motor_name]
 
-            data = self._encode_mit_packet(motor_type, kp, kd, position_degrees, velocity_deg_per_sec, torque)
+            # Logical -> native frame (see _homing_offsets).
+            raw_position = position_degrees + self._homing_offsets.get(motor_name, 0.0)
+            data = self._encode_mit_packet(motor_type, kp, kd, raw_position, velocity_deg_per_sec, torque)
             msg = can.Message(arbitration_id=motor_id, data=data, is_extended_id=False, is_fd=self.use_can_fd)
             self.canbus.send(msg)
-
-            recv_id_to_motor[self._get_motor_recv_id(motor)] = motor_name
 
         # Step 2: Collect responses and update state cache
         responses = self._recv_all_responses(list(recv_id_to_motor.keys()), timeout=SHORT_TIMEOUT_SEC)
@@ -568,10 +643,16 @@ class DamiaoMotorsBus(MotorsBusBase):
         return np.degrees(position_rad), np.degrees(velocity_rad_per_sec), torque, t_mos, t_rotor
 
     def _process_response(self, motor: str, msg: can.Message) -> None:
-        """Decode a message and update the motor state cache."""
+        """Decode a message and update the motor state cache.
+
+        Positions are cached in the LOGICAL frame: the software homing offset is
+        subtracted from the decoded native-frame position (see _homing_offsets).
+        Velocity and torque are frame-independent (the offset is constant).
+        """
         try:
             motor_type = self._motor_types[motor]
             pos, vel, torque, t_mos, t_rotor = self._decode_motor_state(msg.data, motor_type)
+            pos -= self._homing_offsets.get(motor, 0.0)
 
             self._last_known_states[motor] = {
                 "position": pos,
@@ -580,6 +661,7 @@ class DamiaoMotorsBus(MotorsBusBase):
                 "temp_mos": float(t_mos),
                 "temp_rotor": float(t_rotor),
             }
+            self._last_update_ts[motor] = time.monotonic()
         except Exception as e:
             logger.warning(f"Failed to decode response from {motor}: {e}")
 
@@ -673,13 +755,10 @@ class DamiaoMotorsBus(MotorsBusBase):
             result[motor] = self._last_known_states[motor].copy()
         return result
 
-    def _batch_refresh(self, motors: list[str]) -> None:
-        """Internal helper to refresh a list of motors and update cache."""
-
+    def _send_refresh_commands(self, motors: list[str]) -> None:
+        """Send a state-refresh command to each motor."""
         if self.canbus is None:
             raise RuntimeError("CAN bus is not initialized.")
-
-        # Send refresh commands
         for motor in motors:
             motor_id = self._get_motor_id(motor)
             data = [motor_id & 0xFF, (motor_id >> 8) & 0xFF, CAN_CMD_REFRESH, 0, 0, 0, 0, 0]
@@ -688,18 +767,176 @@ class DamiaoMotorsBus(MotorsBusBase):
             )
             self.canbus.send(msg)
 
-        # Collect responses
-        expected_recv_ids = [self._get_motor_recv_id(m) for m in motors]
-        responses = self._recv_all_responses(expected_recv_ids, timeout=MEDIUM_TIMEOUT_SEC)
+    def _drain_pending_responses(self, recv_id_to_motor: dict[int, str]) -> tuple[int, set[str]]:
+        """Consume frames already sitting in the RX buffer before a new request.
 
-        # Update cache
+        Responses that arrive after a collection window has closed (e.g. MIT
+        command responses _mit_control_batch stopped waiting for after
+        SHORT_TIMEOUT_SEC) share their recv IDs with refresh responses. Left in
+        the buffer, the next collection window would match them first and serve
+        cycle-old state as the reply to the request just sent. Processing them
+        here keeps the cache as fresh as possible and guarantees that frames
+        matched after this point were produced by the current request.
+
+        Returns:
+            Tuple of (frames drained, motor names whose state was updated by a
+            drained frame — their cache is now at most one cycle old).
+        """
+        if self.canbus is None:
+            raise RuntimeError("CAN bus is not initialized.")
+        drained = 0
+        updated: set[str] = set()
+        try:
+            while (msg := self.canbus.recv(timeout=0)) is not None:
+                drained += 1
+                motor = recv_id_to_motor.get(msg.arbitration_id)
+                if motor is not None:
+                    self._process_response(motor, msg)
+                    updated.add(motor)
+        except Exception as e:
+            logger.debug(f"Error draining pending responses: {e}")
+        return drained, updated
+
+    def _batch_refresh(self, motors: list[str]) -> set[str]:
+        """Internal helper to refresh a list of motors and update cache.
+
+        Stale leftovers in the RX buffer are drained into the cache first (a
+        drained ack is at most one cycle old). Refresh commands go to every
+        motor, but the collection window only blocks on motors that are not
+        latched; misses are re-requested up to ``refresh_num_retry`` times
+        (short windows) unless the drain already updated them. A motor that
+        misses ``refresh_giveup_after`` cycles in a row is latched — still
+        requested, never waited for — and re-arms only after
+        ``refresh_rearm_after`` consecutive responsive cycles. This keeps the
+        control loop at full rate through the multi-second all-DM4310 silence
+        bursts observed on-robot (2026-08-05) while the cache stays fresh via
+        drained MIT acks.
+
+        Returns:
+            The set of motor names that actually responded in this refresh cycle
+            (motors missing from the set keep their last known cached state).
+        """
+        t_start = time.monotonic()
+        recv_id_to_motor = {self._get_motor_recv_id(m): m for m in motors}
+        drained, fresh_via_drain = self._drain_pending_responses(recv_id_to_motor)
+        self._refresh_stale_drained += drained
+
+        # Latched motors (persistently unresponsive to refresh) are still
+        # requested every cycle but never waited for: on-robot measurement
+        # (2026-08-05) showed silence arrives in multi-second bursts of all
+        # four DM4310s, and waiting for them dragged the 200Hz teleop loop
+        # down to 70Hz. Their state keeps flowing via drained MIT acks.
+        latched = {m for m in motors if self._consecutive_drops[m] >= self.refresh_giveup_after}
+        refreshed: set[str] = set()
+
+        self._send_refresh_commands(motors)
+        blocking = [m for m in motors if m not in latched]
+        responses = self._recv_all_responses(
+            list(recv_id_to_motor.keys()),
+            timeout=MEDIUM_TIMEOUT_SEC,
+            required_recv_ids=[self._get_motor_recv_id(m) for m in blocking],
+        )
         for motor in motors:
-            recv_id = self._get_motor_recv_id(motor)
-            msg = responses.get(recv_id)
-            if msg:
+            if (msg := responses.get(self._get_motor_recv_id(motor))) is not None:
                 self._process_response(motor, msg)
+                refreshed.add(motor)
+
+        # Re-request only motors that neither answered nor got fresh data via
+        # the drain (a drained ack is at most one cycle old — not worth
+        # stalling the loop over).
+        for _ in range(self.refresh_num_retry):
+            pending = [m for m in blocking if m not in refreshed and m not in fresh_via_drain]
+            if not pending:
+                break
+            self._send_refresh_commands(pending)
+            responses = self._recv_all_responses(
+                [self._get_motor_recv_id(m) for m in pending], timeout=RETRY_TIMEOUT_SEC
+            )
+            for motor in pending:
+                if (msg := responses.get(self._get_motor_recv_id(motor))) is not None:
+                    self._process_response(motor, msg)
+                    refreshed.add(motor)
+                    self._refresh_recovered += 1
+
+        now = time.monotonic()
+        for motor in motors:
+            if motor in refreshed:
+                if self._consecutive_drops[motor] >= self.refresh_giveup_after:
+                    # Re-arm only after a sustained clean streak: immediate
+                    # re-arming flapped during intermittent silence and paid
+                    # the full retry budget every second (measured 2026-08-05).
+                    self._consecutive_ok[motor] += 1
+                    if self._consecutive_ok[motor] >= self.refresh_rearm_after:
+                        self._consecutive_drops[motor] = 0
+                        self._consecutive_ok[motor] = 0
+                        logger.info(
+                            f"[{self.port}] {motor}: refresh responses stable for "
+                            f"{self.refresh_rearm_after} cycles, re-requests re-enabled."
+                        )
+                else:
+                    self._consecutive_drops[motor] = 0
             else:
-                logger.warning(f"Packet drop: {motor} (ID: 0x{recv_id:02X}). Using last known state.")
+                self._consecutive_ok[motor] = 0
+                self._consecutive_drops[motor] += 1
+                if motor in fresh_via_drain:
+                    self._refresh_fresh_via_drain += 1
+                else:
+                    self._refresh_drop_counts[motor] = self._refresh_drop_counts.get(motor, 0) + 1
+                if self._consecutive_drops[motor] == self.refresh_giveup_after:
+                    logger.warning(
+                        f"[{self.port}] {motor}: no refresh response {self.refresh_giveup_after} "
+                        "cycles in a row. Still requested each cycle but no longer waited for; "
+                        f"re-requests re-arm after {self.refresh_rearm_after} clean cycles."
+                    )
+            ts = self._last_update_ts.get(motor, 0.0)
+            if ts > 0.0:
+                self._refresh_age_max = max(self._refresh_age_max, now - ts)
+
+        self._refresh_cycles += 1
+        elapsed = time.monotonic() - t_start
+        self._refresh_time_sum += elapsed
+        self._refresh_time_max = max(self._refresh_time_max, elapsed)
+        self._maybe_log_refresh_stats()
+        return refreshed
+
+    def _maybe_log_refresh_stats(self) -> None:
+        """Flush aggregated drop/recovery/staleness counters at most once per second."""
+        now = time.monotonic()
+        window = now - self._refresh_last_log
+        if window < 1.0:
+            return
+        if (
+            self._refresh_drop_counts
+            or self._refresh_recovered
+            or self._refresh_stale_drained
+            or self._refresh_fresh_via_drain
+        ):
+            drops = ", ".join(
+                f"{m} {n}/{self._refresh_cycles}"
+                for m, n in sorted(self._refresh_drop_counts.items(), key=lambda kv: -kv[1])
+            )
+            avg_ms = 1000.0 * self._refresh_time_sum / max(self._refresh_cycles, 1)
+            max_ms = 1000.0 * self._refresh_time_max
+            age_ms = 1000.0 * self._refresh_age_max
+            level = logging.WARNING if self._refresh_drop_counts else logging.INFO
+            logger.log(
+                level,
+                f"[{self.port}] Batch refresh, last {window:.1f}s ({self._refresh_cycles} cycles, "
+                f"avg {avg_ms:.1f}ms, max {max_ms:.1f}ms): drops [{drops or 'none'}] "
+                f"(kept last known state), fresh-via-drain {self._refresh_fresh_via_drain}, "
+                f"recovered by re-request {self._refresh_recovered}, "
+                f"stale leftovers drained {self._refresh_stale_drained}, "
+                f"oldest state {age_ms:.0f}ms.",
+            )
+        self._refresh_last_log = now
+        self._refresh_drop_counts = {}
+        self._refresh_recovered = 0
+        self._refresh_stale_drained = 0
+        self._refresh_fresh_via_drain = 0
+        self._refresh_age_max = 0.0
+        self._refresh_cycles = 0
+        self._refresh_time_sum = 0.0
+        self._refresh_time_max = 0.0
 
     @check_if_not_connected
     def sync_write(self, data_name: str, values: dict[str, Value]) -> None:
@@ -725,7 +962,9 @@ class DamiaoMotorsBus(MotorsBusBase):
                 kp = self._gains[motor]["kp"]
                 kd = self._gains[motor]["kd"]
 
-                data = self._encode_mit_packet(motor_type, kp, kd, float(value_degrees), 0.0, 0.0)
+                # Logical -> native frame (see _homing_offsets).
+                raw_position = float(value_degrees) + self._homing_offsets.get(motor_name, 0.0)
+                data = self._encode_mit_packet(motor_type, kp, kd, raw_position, 0.0, 0.0)
                 msg = can.Message(
                     arbitration_id=motor_id, data=data, is_extended_id=False, is_fd=self.use_can_fd
                 )
@@ -744,6 +983,23 @@ class DamiaoMotorsBus(MotorsBusBase):
             for motor, value in values.items():
                 self.write(data_name, motor, value)
 
+    def read_raw_positions(self, motors: str | list[str] | None = None) -> dict[str, float]:
+        """Read Present_Position in the motor's NATIVE frame (homing offset NOT subtracted).
+
+        Used by the calibration flow to measure the software homing offset at a
+        physical reference pose. Motors that did not respond in the refresh cycle
+        are omitted from the result (callers must check for missing motors before
+        trusting the values).
+        """
+        target_motors = self._get_motors_list(motors)
+        refreshed = self._batch_refresh(target_motors)
+        raw: dict[str, float] = {}
+        for motor in target_motors:
+            if motor in refreshed:
+                state = self._last_known_states[motor]
+                raw[motor] = state["position"] + self._homing_offsets.get(motor, 0.0)
+        return raw
+
     def read_calibration(self) -> dict[str, MotorCalibration]:
         """Read calibration data from motors."""
         # Damiao motors don't store calibration internally
@@ -753,9 +1009,10 @@ class DamiaoMotorsBus(MotorsBusBase):
     def write_calibration(self, calibration_dict: dict[str, MotorCalibration], cache: bool = True) -> None:
         """Write calibration data to motors."""
         # Damiao motors don't store calibration internally
-        # Just cache it in memory
+        # Just cache it in memory (and activate its homing offsets)
         if cache:
             self.calibration = calibration_dict
+            self._refresh_homing_offsets()
 
     def record_ranges_of_motion(
         self,

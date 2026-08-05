@@ -22,7 +22,13 @@ import numpy as np
 
 from lerobot.motors import Motor, MotorCalibration, MotorNormMode
 from lerobot.motors.damiao import DamiaoMotorsBus
-from lerobot.motors.damiao.damiao_alignment import OPENARM_INITIAL_POSITION_DEG, soft_move_to_position
+from lerobot.motors.damiao.damiao_alignment import (
+    check_start_position,
+    resolve_initial_pose,
+    should_rezero_on_connect,
+    soft_move_to_position,
+)
+from lerobot.motors.damiao.damiao_bump_calibration import run_bump_to_stop_calibration
 from lerobot.types import RobotAction
 from lerobot.utils.decorators import check_if_already_connected, check_if_not_connected
 
@@ -116,19 +122,51 @@ class OpenArmLeader(Teleoperator):
             )
             self.calibrate()
 
+        # Persistent zero: decide ONCE whether to burn a fresh motor-side zero
+        # (legacy per-session behavior) or trust the calibration's software
+        # homing offsets (new flow). See should_rezero_on_connect for the rule.
+        rezero = should_rezero_on_connect(self.bus.calibration, self.config.rezero_on_connect)
+        applies_torque = self.config.gravity_compensation or not self.config.manual_control
+        if not rezero and applies_torque:
+            # No re-zero and the leader is about to apply torque (gravity seed in
+            # configure(), then the alignment move): refuse to move if the
+            # readings look grossly out of frame (stale zero after power cycle
+            # etc.). Pure manual_control never applies torque, so no gate needed.
+            check_start_position(
+                self.bus,
+                self._side_joint_limits(),
+                self.config.start_position_tolerance_deg,
+                label=str(self),
+            )
+
         self.configure()
 
-        if self.is_calibrated:
+        if rezero:
             self.bus.set_zero_position()
 
         # Startup alignment (official AdjustPosition port): softly move to the
-        # fixed initial pose so leader and follower start matched. Needs torque,
-        # so pure manual_control (torque-off) mode skips it. In gravity mode the
-        # arm holds the pose (soft position hold) until the teleop loop's first
-        # gravity injection takes over and makes it weightless again.
+        # initial pose so leader and follower start matched. Needs torque, so
+        # pure manual_control (torque-off) mode skips it. The target is the
+        # captured "ready" pose (initial_pose_path / initial_pose_deg) or the
+        # official default. In gravity mode the arm holds the pose (soft position
+        # hold + gravity feed-forward) until the teleop loop's first gravity
+        # injection takes over and makes it weightless again.
         if self.config.align_on_connect:
-            if self.config.gravity_compensation or not self.config.manual_control:
-                soft_move_to_position(self.bus, OPENARM_INITIAL_POSITION_DEG, self.config.align_duration_s)
+            if applies_torque:
+                goal = resolve_initial_pose(
+                    initial_pose_deg=self.config.initial_pose_deg,
+                    initial_pose_path=self.config.initial_pose_path,
+                    joint_limits=self._side_joint_limits(),
+                )
+                # In gravity mode, feed forward G(q) during the ramp so a raised
+                # pose is actually reached and held (soft gains alone sag under
+                # gravity at a lifted pose). Evaluated at the interpolated target.
+                torque_ff_fn = (
+                    self._gravity_tau_from_positions if self.config.gravity_compensation else None
+                )
+                soft_move_to_position(
+                    self.bus, goal, self.config.align_duration_s, torque_ff_fn=torque_ff_fn
+                )
             else:
                 logger.info("align_on_connect skipped: manual_control keeps torque disabled.")
 
@@ -139,17 +177,84 @@ class OpenArmLeader(Teleoperator):
         """Check if teleoperator is calibrated."""
         return self.bus.is_calibrated
 
+    def _side_joint_limits(self) -> dict[str, tuple[float, float]]:
+        """Physical joint limits for this leader's side.
+
+        The leader config has no joint_limits field; reuse the follower's
+        per-side URDF limits (function-level import to avoid a module-level
+        robots<->teleoperators dependency).
+        """
+        from lerobot.robots.openarm_follower.config_openarm_follower import (
+            LEFT_DEFAULT_JOINTS_LIMITS,
+            RIGHT_DEFAULT_JOINTS_LIMITS,
+        )
+
+        return (
+            RIGHT_DEFAULT_JOINTS_LIMITS
+            if self.config.gravity_side == "right"
+            else LEFT_DEFAULT_JOINTS_LIMITS
+        )
+
+    def soft_move_to(self, pose_deg: dict[str, float], duration_s: float = 2.0) -> bool:
+        """Softly drive the leader to ``pose_deg`` on its own bus.
+
+        Same primitive as the connect-time alignment: MIT position commands with
+        the soft AdjustPosition gains, plus the gravity feed-forward in gravity
+        mode so a raised pose is actually reached instead of sagging short of it.
+        Exists because the generic teleop drive path goes through
+        ``send_feedback``, which OpenArm does not implement — without this the
+        per-episode start-pose return silently does nothing.
+
+        Torque is deliberately left on afterwards: the teleop loop's next gravity
+        injection makes the arm weightless again, whereas disabling torque here
+        would drop it under its own weight.
+
+        Returns False when the leader is not under torque (pure manual_control),
+        where driving it would leave it stiff and unusable for teleoperation.
+        """
+        if not (self.config.gravity_compensation or not self.config.manual_control):
+            logger.warning(
+                "soft_move_to: leader runs in torque-off manual_control; refusing to drive it "
+                "(enabling torque here would leave the arm stiff). Move it by hand instead."
+            )
+            return False
+
+        goal = resolve_initial_pose(
+            initial_pose_deg=pose_deg,
+            joint_limits=self._side_joint_limits(),
+        )
+        torque_ff_fn = self._gravity_tau_from_positions if self.config.gravity_compensation else None
+        soft_move_to_position(self.bus, goal, duration_s, torque_ff_fn=torque_ff_fn)
+        return True
+
     def calibrate(self) -> None:
         """
-        Run calibration procedure for OpenArms leader.
+        Run calibration procedure for OpenArms leader (persistent software zero).
 
-        The calibration procedure:
+        Two anchor modes (config.calibration_anchor), same semantics as
+        OpenArmFollower.calibrate:
+
+        "hang_down" (default):
         1. Disable torque (if not already disabled)
-        2. Ask user to position arm in zero position (hanging with gripper closed)
-        3. Set this as zero position
-        4. Record range of motion for each joint
-        5. Save calibration
+        2. Ask user to position the arm hanging straight down, gripper closed
+        3. Read the motors' NATIVE positions at that reference and store them as
+           software homing offsets in the calibration file (logical zero =
+           hang-down = URDF zero). The motor-side zero (Damiao 0xFE) is
+           intentionally NOT burned — see OpenArmFollower.calibrate for why.
+        4. Save calibration (with the fixed ±90° default range)
+
+        "bump_to_stop" (opt-in): sweep each ARM joint into its mechanical hard
+        stop and anchor the zero there (offset = raw_at_stop - stop_angle);
+        gripper never bumped, offset pinned to 0 (hand flash-zero it first with
+        openarm_gripper_zero.py). The sequence side comes from
+        config.gravity_side — set it explicitly. See
+        lerobot.motors.damiao.damiao_bump_calibration.
         """
+        if self.config.calibration_anchor not in ("hang_down", "bump_to_stop"):
+            raise ValueError(
+                f"calibration_anchor must be 'hang_down' or 'bump_to_stop', "
+                f"got {self.config.calibration_anchor!r}"
+            )
         if self.calibration:
             # Calibration file exists, ask user whether to use it or run new calibration
             user_input = input(
@@ -161,20 +266,57 @@ class OpenArmLeader(Teleoperator):
                 return
 
         logger.info(f"\nRunning calibration for {self}")
-        self.bus.disable_torque()
 
-        # Step 1: Set zero position
-        input(
-            "\nCalibration: Set Zero Position)\n"
-            "Position the arm in the following configuration:\n"
-            "  - Arm hanging straight down\n"
-            "  - Gripper closed\n"
-            "Press ENTER when ready..."
+        if self.config.calibration_anchor == "bump_to_stop":
+            if self.config.gravity_side not in ("left", "right"):
+                raise ValueError(
+                    "calibration_anchor='bump_to_stop' requires gravity_side='left' or 'right' "
+                    "(the bump sequence and stop angles are side-specific)."
+                )
+            homing_offsets = run_bump_to_stop_calibration(
+                self.bus,
+                side=self.config.gravity_side,
+                joint_limits=self._side_joint_limits(),
+                stop_angles_override=self.config.bump_stop_angles_deg,
+                torque_thresholds_nm=self.config.bump_torque_thresholds_nm,
+                velocity_thresholds_deg_s=self.config.bump_velocity_thresholds_deg_s,
+                label=str(self),
+            )
+        else:
+            self.bus.disable_torque()
+
+            # Step 1: capture the reference pose (software homing offsets)
+            input(
+                "\nCalibration: capture reference (persistent software zero)\n"
+                "If a motor-side zero was ever written this session, POWER-CYCLE the arm first\n"
+                "(so the captured offsets reference the persistent boot frame).\n"
+                "Position the arm in the following configuration:\n"
+                "  - Arm hanging straight down\n"
+                "  - Gripper closed\n"
+                "Press ENTER when ready..."
+            )
+
+            raw_positions = self.bus.read_raw_positions()
+            missing = [motor for motor in self.bus.motors if motor not in raw_positions]
+            if missing:
+                raise RuntimeError(
+                    f"Calibration aborted: no position response from {missing}. "
+                    "Check CAN wiring / motor power and retry."
+                )
+            homing_offsets = raw_positions
+
+        logger.info(
+            "Captured homing offsets (deg): "
+            + ", ".join(f"{m}={v:.2f}" for m, v in homing_offsets.items())
         )
-
-        # Set current position as zero for all motors
-        self.bus.set_zero_position()
-        logger.info("Arm zero position set.")
+        for motor_name, offset in homing_offsets.items():
+            if abs(offset) > 120.0:
+                logger.warning(
+                    f"{motor_name}: homing offset {offset:.1f} deg is close to the ±180 deg "
+                    "single-turn window; boot-time readings may wrap. Consider burning the motor "
+                    "zero once at this pose (openarm-can-cli set_zero), power-cycling, and "
+                    "re-running this calibration so offsets end up near 0."
+                )
 
         logger.info("Setting range: -90° to +90° by default for all joints")
         # TODO(Steven, Pepijn): Check if MotorCalibration is actually needed here given that we only use Degrees
@@ -182,7 +324,7 @@ class OpenArmLeader(Teleoperator):
             self.calibration[motor_name] = MotorCalibration(
                 id=motor.id,
                 drive_mode=0,
-                homing_offset=0,
+                homing_offset=homing_offsets[motor_name],
                 range_min=-90,
                 range_max=90,
             )
@@ -270,32 +412,42 @@ class OpenArmLeader(Teleoperator):
             f"urdf={cfg.gravity_urdf_path})"
         )
 
+    def _gravity_tau_from_positions(self, pos_deg_by_motor: dict[str, float | None]) -> dict[str, float]:
+        """Gravity feed-forward torque per ARM motor for a given joint pose (deg).
+
+        ``pos_deg_by_motor`` maps motor name -> position in degrees (extra keys
+        such as ``gripper`` are ignored; the gripper is not in the gravity chain).
+        Positions from lerobot are in DEGREES; the model needs RADIANS. The leader
+        zero (arm hanging straight down) coincides with the URDF zero, so positions
+        map directly with no offset (verified offline via FK). Returns ``{}`` when
+        the gravity model is not built (gravity_compensation off).
+        """
+        if self._grav_model is None:
+            return {}
+        pin = self._grav_pin
+        q = np.zeros(self._grav_model.nq)
+        for k, qi in enumerate(self._grav_qidx):
+            pos_deg = pos_deg_by_motor.get(self._arm_motor_names[k])
+            q[qi] = np.radians(pos_deg) if pos_deg is not None else 0.0
+        g = pin.computeGeneralizedGravity(self._grav_model, self._grav_data, q)
+        tau = self.config.gravity_scale * np.array([g[i] for i in self._grav_vidx])
+        return {motor: float(tau[k]) for k, motor in enumerate(self._arm_motor_names)}
+
     def _inject_gravity(self) -> dict[str, dict[str, Any]]:
         """Read joint positions, compute the gravity torque G(q), and inject it as a
         pure MIT torque feed-forward (kp=kd=0). Returns the freshly-read motor states.
 
         Mirrors the C++ loop: read q -> JntToGravity(q) -> MITParam{0,0,0,0,tau}.
-        Positions from lerobot are in DEGREES; the model needs RADIANS. The leader
-        zero (arm hanging straight down) coincides with the URDF zero, so positions
-        map directly with no offset (verified offline via FK).
         """
-        pin = self._grav_pin
-        cfg = self.config
         states = self.bus.sync_read_all_states()
-
-        q = np.zeros(self._grav_model.nq)
-        for k, qi in enumerate(self._grav_qidx):
-            pos_deg = states.get(self._arm_motor_names[k], {}).get("position")
-            q[qi] = np.radians(pos_deg) if pos_deg is not None else 0.0
-
-        g = pin.computeGeneralizedGravity(self._grav_model, self._grav_data, q)
-        tau = cfg.gravity_scale * np.array([g[i] for i in self._grav_vidx])
+        pos_by_motor = {m: states.get(m, {}).get("position") for m in self._arm_motor_names}
+        tau = self._gravity_tau_from_positions(pos_by_motor)
 
         # Arm joints: pure gravity torque. Gripper: free (torque 0) so it can still
         # be moved by hand for teleop while we read back its position.
         commands: dict[str, tuple[float, float, float, float, float]] = {}
-        for k, motor in enumerate(self._arm_motor_names):
-            commands[motor] = (0.0, 0.0, 0.0, 0.0, float(tau[k]))
+        for motor in self._arm_motor_names:
+            commands[motor] = (0.0, 0.0, 0.0, 0.0, tau.get(motor, 0.0))
         if "gripper" in self.bus.motors:
             commands["gripper"] = (0.0, 0.0, 0.0, 0.0, 0.0)
 

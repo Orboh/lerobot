@@ -86,9 +86,11 @@ lerobot-record \\
 ```
 """
 
+import json
 import logging
 import time
 from dataclasses import asdict, dataclass
+from pathlib import Path
 from pprint import pformat
 
 from lerobot.cameras import CameraConfig  # noqa: F401
@@ -100,6 +102,8 @@ from lerobot.common.control_utils import (
     init_keyboard_listener,
     is_headless,
     sanity_check_dataset_robot_compatibility,
+    wait_for_episode_cue,
+    wait_for_start_pose,
 )
 from lerobot.configs import parser
 from lerobot.configs.dataset import DatasetRecordConfig
@@ -180,8 +184,45 @@ class RecordConfig:
     play_sounds: bool = True
     # Resume recording on an existing dataset.
     resume: bool = False
+    # How far a joint may sit from the start pose, in degrees. None (default)
+    # leaves the start pose unmanaged, which is how recording behaved before.
+    # The reference pose is the one read right after connect, i.e. after the
+    # robot's own startup alignment. What the number gates depends on
+    # episode_advance: with "manual" it verifies the operator-cued return landed;
+    # with "auto" it is the threshold an episode must satisfy before it starts,
+    # with the operator bringing the arm back by hand. It matters because the
+    # startup alignment only fires once per session, so a per-episode manual
+    # reset makes every episode start from a slightly different pose (measured on
+    # OpenArm: a fifth to a quarter of the joint range on J1/J4/J6/J7), and a
+    # policy trained on few episodes regresses toward that mean pose.
+    # Keep literal percent signs out of these comments: draccus turns them into
+    # argparse help strings, and a stray percent sign there breaks --help.
+    start_pose_tolerance_deg: float | None = None
+    # Only used when episode_advance="auto": stop waiting for the start pose after
+    # this long and record anyway, so an unattended session cannot block forever.
+    # The "manual" flow waits indefinitely instead, since a human is always there.
+    start_pose_max_wait_s: float = 120.0
+    # Include the gripper in the start-pose check. Off by default: what it reads
+    # at the end of an episode legitimately depends on what was grasped, so
+    # checking it produces noise. This only affects the check — the gripper is
+    # always part of what the arm is returned to, matching what lerobot-rollout
+    # restores between inference episodes.
+    start_pose_gate_gripper: bool = False
+    # Append one JSON line per episode with the start-pose deviation to this file
+    # (the collection manifest). None disables the file; deviations are logged to
+    # the console either way.
+    start_pose_log_path: str | None = None
+    # How the recording advances between episodes.
+    #   "auto"   - the timed flow: a fixed reset window, then the next episode
+    #              starts on its own. Good for batching through episodes quickly.
+    #   "manual" - the operator drives the boundary: 'a' returns both arms to the
+    #              start pose (clearing the workspace first), then the right arrow
+    #              starts the next episode once the scene is restored.
+    episode_advance: str = "auto"
 
     def __post_init__(self):
+        if self.episode_advance not in ("auto", "manual"):
+            raise ValueError(f"episode_advance must be 'auto' or 'manual', got {self.episode_advance!r}")
         if self.teleop is None:
             raise ValueError(
                 "A teleoperator is required for recording. "
@@ -214,6 +255,110 @@ class RecordConfig:
                                V
                   ( Rerun Log / Loop Wait )
 """
+
+
+def _utc_now() -> str:
+    """UTC timestamp with an explicit Z.
+
+    The log is read on a different machine from the one that records (the run
+    directory is pulled to a Vault shared between machines), and sessions are
+    compared across days. A local naive timestamp cannot be ordered against
+    another machine's, and silently shifts under DST, so everything written here
+    is UTC and says so.
+    """
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def _write_start_pose_reference(
+    path: str | None,
+    target_pos: dict[str, float],
+    verify_pos: dict[str, float],
+    episode_advance: str,
+    tolerance_deg: float | None,
+    gate_gripper: bool,
+) -> None:
+    """Write the pose every deviation in this file is measured against.
+
+    Without it the log is a column of numbers with no stated origin: a reader
+    cannot tell whether "joint_4 = 7.4deg" means the arm was misplaced or the
+    reference itself moved (a re-calibration changes the reference). The console
+    dump has the pose, but the console is not what survives into the Vault.
+
+    Written as the first line of the file so an appended per-episode row never
+    has to carry it. Skipped if the file already exists, which keeps ``--resume``
+    from inserting a second reference mid-file.
+    """
+    if not path or not target_pos:
+        return
+    entry = {
+        "type": "start_pose_reference",
+        "timestamp": _utc_now(),
+        "episode_advance": episode_advance,
+        "tolerance_deg": tolerance_deg,
+        "gate_gripper": gate_gripper,
+        # Everything the arms are returned to, gripper included.
+        "target_pos": {k: round(v, 3) for k, v in sorted(target_pos.items())},
+        # The subset the deviations below are actually judged on.
+        "checked_joints": sorted(verify_pos),
+    }
+    try:
+        log_path = Path(path).expanduser()
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        if log_path.exists():
+            return
+        with log_path.open("a") as f:
+            f.write(json.dumps(entry) + "\n")
+    except Exception as e:
+        logging.warning("Could not write the start-pose reference to %s: %s", path, e)
+
+
+def _log_start_pose_deviation(
+    path: str | None,
+    episode_index: int,
+    deviation: dict[str, float],
+    outcome: str,
+    tolerance_deg: float | None,
+) -> None:
+    """Record how far the arm was from the start pose when an episode began.
+
+    Always logs a one-line summary; also appends a JSON line to ``path`` when
+    given, so the per-episode start pose can be audited after the fact instead of
+    being reconstructed from the recorded frames (which is how the 19-28% start
+    scatter went unnoticed across 25 episodes).
+    """
+    if not deviation:
+        return
+
+    worst = max(deviation, key=deviation.get)
+    logging.info(
+        "Episode %d start pose: worst %s=%.1fdeg (tolerance %s, outcome=%s).",
+        episode_index,
+        worst,
+        deviation[worst],
+        f"{tolerance_deg:.1f}deg" if tolerance_deg is not None else "not checked",
+        outcome,
+    )
+    if not path:
+        return
+
+    entry = {
+        "type": "episode",
+        "timestamp": _utc_now(),
+        "episode_index": episode_index,
+        "outcome": outcome,
+        "tolerance_deg": tolerance_deg,
+        "worst_joint": worst,
+        "worst_deviation_deg": round(deviation[worst], 3),
+        "deviation_deg": {k: round(v, 3) for k, v in sorted(deviation.items())},
+    }
+    try:
+        log_path = Path(path).expanduser()
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        with log_path.open("a") as f:
+            f.write(json.dumps(entry) + "\n")
+    except Exception as e:
+        # A failed audit log must never abort a recording session.
+        logging.warning("Could not append the start-pose log to %s: %s", path, e)
 
 
 @safe_stop_image_writer
@@ -448,9 +593,153 @@ def record(
                 "Streaming encoding is disabled. If you have capable hardware, consider enabling it for way faster episode saving. --dataset.streaming_encoding=true --dataset.encoder_threads=2 # --dataset.camera_encoder.vcodec=auto. More info in the documentation: https://huggingface.co/docs/lerobot/streaming_video_encoding"
             )
 
+        # The pose right after connect is the start pose: the robot's startup
+        # alignment has just run, so this is the "correct" pose every episode
+        # should begin from. Captured once and reused as the target every episode
+        # returns to — the same thing lerobot-rollout does via its initial_position.
+        start_pose: dict[str, float] = {}
+        verify_pose: dict[str, float] = {}
+        if cfg.start_pose_tolerance_deg is not None or cfg.episode_advance == "manual":
+            # Every joint, gripper included: this is what the arms are returned to,
+            # and it has to match what lerobot-rollout returns to between inference
+            # episodes (which covers the full .pos set) or collection and inference
+            # would start from different states.
+            start_pose = {
+                k: v for k, v in robot.get_observation().items() if k.endswith(".pos") and v is not None
+            }
+            # The gripper is returned but not judged by default: what it reads at
+            # the end of an episode legitimately depends on what was grasped.
+            verify_pose = {
+                k: v for k, v in start_pose.items() if cfg.start_pose_gate_gripper or "gripper" not in k
+            }
+            if start_pose:
+                logging.info(
+                    "Start pose captured on %d joints, %d checked (advance=%s, tolerance=%s): %s",
+                    len(start_pose),
+                    len(verify_pose),
+                    cfg.episode_advance,
+                    f"{cfg.start_pose_tolerance_deg:.1f}deg"
+                    if cfg.start_pose_tolerance_deg is not None
+                    else "not checked",
+                    ", ".join(f"{k}={v:.1f}" for k, v in sorted(start_pose.items())),
+                )
+                if cfg.episode_advance == "manual":
+                    logging.info(
+                        "Manual episode advance: after each episode press 'a' to return both arms to "
+                        "the start pose, restore the scene, then press the right arrow to start the "
+                        "next episode (left arrow re-records, esc stops)."
+                    )
+                # Record what the per-episode deviations below are measured against,
+                # so the log stands on its own once it leaves this machine.
+                _write_start_pose_reference(
+                    cfg.start_pose_log_path,
+                    start_pose,
+                    verify_pose,
+                    cfg.episode_advance,
+                    cfg.start_pose_tolerance_deg,
+                    cfg.start_pose_gate_gripper,
+                )
+            else:
+                logging.warning(
+                    "Start-pose handling requested but the robot reported no usable joint positions; "
+                    "recording without it."
+                )
+
+        def start_pose_teleop_slice(seconds: float) -> None:
+            """Run the plain teleop loop briefly so the follower tracks the leader.
+
+            Uses a private events dict: ``record_loop`` consumes ``exit_early``
+            when it breaks, which would swallow the operator's right-arrow
+            override before the gate could see it on the shared dict.
+            """
+            record_loop(
+                robot=robot,
+                events={
+                    "exit_early": False,
+                    "rerecord_episode": False,
+                    "stop_recording": False,
+                    "align_start_pose": False,
+                },
+                fps=cfg.dataset.fps,
+                teleop_action_processor=teleop_action_processor,
+                robot_action_processor=robot_action_processor,
+                robot_observation_processor=robot_observation_processor,
+                teleop=teleop,
+                control_time_s=seconds,
+                single_task=cfg.dataset.single_task,
+                display_data=cfg.display_data,
+            )
+
         with VideoEncodingManager(dataset):
             recorded_episodes = 0
+            # Start-pose result carried over from the manual cue, logged at the top
+            # of the next iteration where the episode index it belongs to is known
+            # (a re-record reuses the same index).
+            pending_start_pose: tuple[dict[str, float], str] | None = None
+            # Set after a discarded take in manual mode: the retake needs the arm
+            # returned again, and the cue for it has to run before recording.
+            cue_before_next_record = False
             while recorded_episodes < cfg.dataset.num_episodes and not events["stop_recording"]:
+                if pending_start_pose is not None:
+                    _log_start_pose_deviation(
+                        cfg.start_pose_log_path,
+                        dataset.num_episodes,
+                        *pending_start_pose,
+                        cfg.start_pose_tolerance_deg,
+                    )
+                    pending_start_pose = None
+
+                if cue_before_next_record and start_pose:
+                    cue_before_next_record = False
+                    deviation, outcome = wait_for_episode_cue(
+                        robot=robot,
+                        events=events,
+                        target_pos=start_pose,
+                        verify_pos=verify_pose,
+                        teleop=teleop,
+                        teleop_slice=start_pose_teleop_slice,
+                        verify_deg=cfg.start_pose_tolerance_deg,
+                        play_sounds=cfg.play_sounds,
+                    )
+                    _log_start_pose_deviation(
+                        cfg.start_pose_log_path,
+                        dataset.num_episodes,
+                        deviation,
+                        outcome,
+                        cfg.start_pose_tolerance_deg,
+                    )
+                    if outcome == "stopped":
+                        break
+                    if outcome == "rerecord":
+                        # Nothing has been recorded yet to discard. The left
+                        # arrow sets BOTH flags; exit_early must be cleared too
+                        # or the next record_loop exits instantly with a
+                        # zero-frame take.
+                        events["rerecord_episode"] = False
+                        events["exit_early"] = False
+
+                if start_pose and cfg.episode_advance == "auto":
+                    deviation, outcome = wait_for_start_pose(
+                        robot=robot,
+                        events=events,
+                        target_pos=start_pose,
+                        verify_pos=verify_pose,
+                        tolerance_deg=cfg.start_pose_tolerance_deg,
+                        teleop=teleop,
+                        teleop_slice=start_pose_teleop_slice,
+                        max_wait_s=cfg.start_pose_max_wait_s,
+                        play_sounds=cfg.play_sounds,
+                    )
+                    _log_start_pose_deviation(
+                        cfg.start_pose_log_path,
+                        dataset.num_episodes,
+                        deviation,
+                        outcome,
+                        cfg.start_pose_tolerance_deg,
+                    )
+                    if outcome == "stopped":
+                        break
+
                 log_say(f"Recording episode {dataset.num_episodes}", cfg.play_sounds)
                 record_loop(
                     robot=robot,
@@ -467,11 +756,36 @@ def record(
                     display_compressed_images=display_compressed_images,
                 )
 
+                is_last_episode = recorded_episodes >= cfg.dataset.num_episodes - 1
+                if cfg.episode_advance == "manual" and start_pose:
+                    # The operator owns the boundary: 'a' returns the arms (which
+                    # clears the workspace before anything is placed in it), then
+                    # the right arrow starts the next episode. Skipped after the
+                    # final episode, where there is no next one to set up.
+                    if not events["stop_recording"] and (not is_last_episode or events["rerecord_episode"]):
+                        pending_start_pose = wait_for_episode_cue(
+                            robot=robot,
+                            events=events,
+                            target_pos=start_pose,
+                            verify_pos=verify_pose,
+                            teleop=teleop,
+                            teleop_slice=start_pose_teleop_slice,
+                            verify_deg=cfg.start_pose_tolerance_deg,
+                            play_sounds=cfg.play_sounds,
+                        )
+                        if pending_start_pose[1] == "stopped":
+                            # Fall through so the episode just recorded is still
+                            # saved; the while condition ends the run.
+                            pending_start_pose = None
+                        elif pending_start_pose[1] == "rerecord":
+                            # The handler below discards the take. The arm still
+                            # has to be returned before the retake, so ask for the
+                            # cue again at the top of the loop.
+                            pending_start_pose = None
+                            cue_before_next_record = True
                 # Execute a few seconds without recording to give time to manually reset the environment
                 # Skip reset for the last episode to be recorded
-                if not events["stop_recording"] and (
-                    (recorded_episodes < cfg.dataset.num_episodes - 1) or events["rerecord_episode"]
-                ):
+                elif not events["stop_recording"] and (not is_last_episode or events["rerecord_episode"]):
                     log_say("Reset the environment", cfg.play_sounds)
 
                     record_loop(
@@ -492,6 +806,14 @@ def record(
                     events["rerecord_episode"] = False
                     events["exit_early"] = False
                     dataset.clear_episode_buffer()
+                    continue
+
+                if not dataset.has_pending_frames():
+                    # A take can reach this point with zero frames (a stale
+                    # exit flag, or stop requested before the first frame).
+                    # Saving would raise deep in the writer and kill the whole
+                    # session, losing nothing but aborting everything else.
+                    logging.warning("No frames in the current take - nothing to save.")
                     continue
 
                 dataset.save_episode()
