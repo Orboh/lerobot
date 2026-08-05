@@ -151,6 +151,22 @@ class DamiaoMotorsBus(MotorsBusBase):
         # Defaults: Kp=10.0 (Stiffness), Kd=0.5 (Damping)
         self._gains: dict[str, dict[str, float]] = {name: {"kp": 10.0, "kd": 0.5} for name in self.motors}
 
+        # Batch-refresh bookkeeping (see _batch_refresh): re-request budget for
+        # motors that miss a collection window, per-motor consecutive-miss
+        # counters for the give-up latch, and aggregated drop/recovery counters
+        # flushed by _maybe_log_refresh_stats at most once per second (per-cycle
+        # warnings over an ssh console are themselves a control-loop hazard).
+        self.refresh_num_retry: int = 2
+        self.refresh_giveup_after: int = 3
+        self._consecutive_drops: dict[str, int] = dict.fromkeys(self.motors, 0)
+        self._refresh_drop_counts: dict[str, int] = {}
+        self._refresh_recovered: int = 0
+        self._refresh_stale_drained: int = 0
+        self._refresh_cycles: int = 0
+        self._refresh_time_sum: float = 0.0
+        self._refresh_time_max: float = 0.0
+        self._refresh_last_log: float = time.monotonic()
+
         # Software homing offsets in DEGREES, loaded from the calibration file.
         # Damiao motors cannot persist a calibration internally and the 0xFE
         # "set zero" command's flash persistence is firmware-dependent, so the
@@ -543,10 +559,15 @@ class DamiaoMotorsBus(MotorsBusBase):
         if not commands:
             return
 
-        recv_id_to_motor: dict[int, str] = {}
-
         if self.canbus is None:
             raise RuntimeError("CAN bus is not initialized.")
+
+        recv_id_to_motor: dict[int, str] = {
+            self._get_motor_recv_id(motor): self._get_motor_name(motor) for motor in commands
+        }
+        # Leftover responses from a previous collection window would otherwise
+        # be matched below as acks of the commands sent in this cycle.
+        self._refresh_stale_drained += self._drain_pending_responses(recv_id_to_motor)
 
         # Step 1: Send all MIT control commands
         for motor, (kp, kd, position_degrees, velocity_deg_per_sec, torque) in commands.items():
@@ -559,8 +580,6 @@ class DamiaoMotorsBus(MotorsBusBase):
             data = self._encode_mit_packet(motor_type, kp, kd, raw_position, velocity_deg_per_sec, torque)
             msg = can.Message(arbitration_id=motor_id, data=data, is_extended_id=False, is_fd=self.use_can_fd)
             self.canbus.send(msg)
-
-            recv_id_to_motor[self._get_motor_recv_id(motor)] = motor_name
 
         # Step 2: Collect responses and update state cache
         responses = self._recv_all_responses(list(recv_id_to_motor.keys()), timeout=SHORT_TIMEOUT_SEC)
@@ -720,18 +739,10 @@ class DamiaoMotorsBus(MotorsBusBase):
             result[motor] = self._last_known_states[motor].copy()
         return result
 
-    def _batch_refresh(self, motors: list[str]) -> set[str]:
-        """Internal helper to refresh a list of motors and update cache.
-
-        Returns:
-            The set of motor names that actually responded in this refresh cycle
-            (motors missing from the set keep their last known cached state).
-        """
-
+    def _send_refresh_commands(self, motors: list[str]) -> None:
+        """Send a state-refresh command to each motor."""
         if self.canbus is None:
             raise RuntimeError("CAN bus is not initialized.")
-
-        # Send refresh commands
         for motor in motors:
             motor_id = self._get_motor_id(motor)
             data = [motor_id & 0xFF, (motor_id >> 8) & 0xFF, CAN_CMD_REFRESH, 0, 0, 0, 0, 0]
@@ -740,21 +751,120 @@ class DamiaoMotorsBus(MotorsBusBase):
             )
             self.canbus.send(msg)
 
-        # Collect responses
-        expected_recv_ids = [self._get_motor_recv_id(m) for m in motors]
-        responses = self._recv_all_responses(expected_recv_ids, timeout=MEDIUM_TIMEOUT_SEC)
+    def _drain_pending_responses(self, recv_id_to_motor: dict[int, str]) -> int:
+        """Consume frames already sitting in the RX buffer before a new request.
 
-        # Update cache
+        Responses that arrive after a collection window has closed (e.g. MIT
+        command responses _mit_control_batch stopped waiting for after
+        SHORT_TIMEOUT_SEC) share their recv IDs with refresh responses. Left in
+        the buffer, the next collection window would match them first and serve
+        cycle-old state as the reply to the request just sent. Processing them
+        here keeps the cache as fresh as possible and guarantees that frames
+        matched after this point were produced by the current request.
+
+        Returns:
+            Number of frames drained (matched to a motor or not).
+        """
+        if self.canbus is None:
+            raise RuntimeError("CAN bus is not initialized.")
+        drained = 0
+        try:
+            while (msg := self.canbus.recv(timeout=0)) is not None:
+                drained += 1
+                motor = recv_id_to_motor.get(msg.arbitration_id)
+                if motor is not None:
+                    self._process_response(motor, msg)
+        except Exception as e:
+            logger.debug(f"Error draining pending responses: {e}")
+        return drained
+
+    def _batch_refresh(self, motors: list[str]) -> set[str]:
+        """Internal helper to refresh a list of motors and update cache.
+
+        Stale leftovers in the RX buffer are drained into the cache first, then
+        motors that do not answer within the collection window are re-requested
+        up to ``refresh_num_retry`` times. A motor that misses every window
+        ``refresh_giveup_after`` cycles in a row is no longer re-requested (one
+        request per cycle only) until it responds again, so a dead motor
+        degrades to the single-window cost instead of burning the whole retry
+        budget every cycle.
+
+        Returns:
+            The set of motor names that actually responded in this refresh cycle
+            (motors missing from the set keep their last known cached state).
+        """
+        t_start = time.monotonic()
+        recv_id_to_motor = {self._get_motor_recv_id(m): m for m in motors}
+        self._refresh_stale_drained += self._drain_pending_responses(recv_id_to_motor)
+
         refreshed: set[str] = set()
+        pending = list(motors)
+        for attempt in range(1 + self.refresh_num_retry):
+            if attempt > 0:
+                pending = [m for m in pending if self._consecutive_drops[m] < self.refresh_giveup_after]
+            if not pending:
+                break
+            self._send_refresh_commands(pending)
+            responses = self._recv_all_responses(
+                [self._get_motor_recv_id(m) for m in pending], timeout=MEDIUM_TIMEOUT_SEC
+            )
+            for motor in pending:
+                if (msg := responses.get(self._get_motor_recv_id(motor))) is not None:
+                    self._process_response(motor, msg)
+                    refreshed.add(motor)
+                    if attempt > 0:
+                        self._refresh_recovered += 1
+            pending = [m for m in pending if m not in refreshed]
+
         for motor in motors:
-            recv_id = self._get_motor_recv_id(motor)
-            msg = responses.get(recv_id)
-            if msg:
-                self._process_response(motor, msg)
-                refreshed.add(motor)
+            if motor in refreshed:
+                if self._consecutive_drops[motor] >= self.refresh_giveup_after:
+                    logger.info(f"{motor}: refresh responses resumed, re-requests re-enabled.")
+                self._consecutive_drops[motor] = 0
             else:
-                logger.warning(f"Packet drop: {motor} (ID: 0x{recv_id:02X}). Using last known state.")
+                self._consecutive_drops[motor] += 1
+                self._refresh_drop_counts[motor] = self._refresh_drop_counts.get(motor, 0) + 1
+                if self._consecutive_drops[motor] == self.refresh_giveup_after:
+                    logger.warning(
+                        f"{motor}: no refresh response {self.refresh_giveup_after} cycles in a row. "
+                        "Disabling re-requests for it (one request per cycle) until it responds again."
+                    )
+
+        self._refresh_cycles += 1
+        elapsed = time.monotonic() - t_start
+        self._refresh_time_sum += elapsed
+        self._refresh_time_max = max(self._refresh_time_max, elapsed)
+        self._maybe_log_refresh_stats()
         return refreshed
+
+    def _maybe_log_refresh_stats(self) -> None:
+        """Flush aggregated drop/recovery/staleness counters at most once per second."""
+        now = time.monotonic()
+        window = now - self._refresh_last_log
+        if window < 1.0:
+            return
+        if self._refresh_drop_counts or self._refresh_recovered or self._refresh_stale_drained:
+            drops = ", ".join(
+                f"{m} {n}/{self._refresh_cycles}"
+                for m, n in sorted(self._refresh_drop_counts.items(), key=lambda kv: -kv[1])
+            )
+            avg_ms = 1000.0 * self._refresh_time_sum / max(self._refresh_cycles, 1)
+            max_ms = 1000.0 * self._refresh_time_max
+            level = logging.WARNING if self._refresh_drop_counts else logging.INFO
+            logger.log(
+                level,
+                f"Batch refresh, last {window:.1f}s ({self._refresh_cycles} cycles, "
+                f"avg {avg_ms:.1f}ms, max {max_ms:.1f}ms): drops [{drops or 'none'}] "
+                f"(kept last known state), recovered by re-request {self._refresh_recovered}, "
+                f"stale leftovers drained {self._refresh_stale_drained}.",
+            )
+        self._refresh_last_log = now
+        self._refresh_drop_counts = {}
+        self._refresh_recovered = 0
+        self._refresh_stale_drained = 0
+        self._refresh_cycles = 0
+        self._refresh_time_sum = 0.0
+        self._refresh_time_max = 0.0
 
     @check_if_not_connected
     def sync_write(self, data_name: str, values: dict[str, Value]) -> None:
