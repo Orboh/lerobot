@@ -711,8 +711,12 @@ def record(
                     if outcome == "stopped":
                         break
                     if outcome == "rerecord":
-                        # Nothing has been recorded yet to discard.
+                        # Nothing has been recorded yet to discard. The left
+                        # arrow sets BOTH flags; exit_early must be cleared too
+                        # or the next record_loop exits instantly with a
+                        # zero-frame take.
                         events["rerecord_episode"] = False
+                        events["exit_early"] = False
 
                 if start_pose and cfg.episode_advance == "auto":
                     deviation, outcome = wait_for_start_pose(
@@ -802,6 +806,14 @@ def record(
                     events["rerecord_episode"] = False
                     events["exit_early"] = False
                     dataset.clear_episode_buffer()
+                    continue
+
+                if not dataset.has_pending_frames():
+                    # A take can reach this point with zero frames (a stale
+                    # exit flag, or stop requested before the first frame).
+                    # Saving would raise deep in the writer and kill the whole
+                    # session, losing nothing but aborting everything else.
+                    logging.warning("No frames in the current take - nothing to save.")
                     continue
 
                 dataset.save_episode()
