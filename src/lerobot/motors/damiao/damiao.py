@@ -61,6 +61,7 @@ logger = logging.getLogger(__name__)
 
 LONG_TIMEOUT_SEC = 0.1
 MEDIUM_TIMEOUT_SEC = 0.01
+RETRY_TIMEOUT_SEC = 0.003
 SHORT_TIMEOUT_SEC = 0.001
 PRECISE_TIMEOUT_SEC = 0.0001
 
@@ -158,10 +159,15 @@ class DamiaoMotorsBus(MotorsBusBase):
         # warnings over an ssh console are themselves a control-loop hazard).
         self.refresh_num_retry: int = 2
         self.refresh_giveup_after: int = 3
+        self.refresh_rearm_after: int = 100
         self._consecutive_drops: dict[str, int] = dict.fromkeys(self.motors, 0)
+        self._consecutive_ok: dict[str, int] = dict.fromkeys(self.motors, 0)
+        self._last_update_ts: dict[str, float] = dict.fromkeys(self.motors, 0.0)
         self._refresh_drop_counts: dict[str, int] = {}
         self._refresh_recovered: int = 0
         self._refresh_stale_drained: int = 0
+        self._refresh_fresh_via_drain: int = 0
+        self._refresh_age_max: float = 0.0
         self._refresh_cycles: int = 0
         self._refresh_time_sum: float = 0.0
         self._refresh_time_max: float = 0.0
@@ -445,34 +451,42 @@ class DamiaoMotorsBus(MotorsBusBase):
         return None
 
     def _recv_all_responses(
-        self, expected_recv_ids: list[int], timeout: float = 0.002
+        self,
+        expected_recv_ids: list[int],
+        timeout: float = 0.002,
+        required_recv_ids: list[int] | None = None,
     ) -> dict[int, can.Message]:
         """
         Efficiently receive responses from multiple motors at once.
         Uses the OpenArms pattern: collect all available messages within timeout.
 
         Args:
-            expected_recv_ids: List of CAN IDs we expect responses from
+            expected_recv_ids: CAN IDs whose frames are accepted into the result
             timeout: Total timeout in seconds (default: 2ms)
+            required_recv_ids: IDs the window blocks on; defaults to all expected
+                IDs. The loop exits once every required ID has answered (or on
+                timeout). Frames from non-required expected IDs are still matched
+                if they arrive before the window closes — this lets callers keep
+                requesting a latched (unresponsive) motor without paying its
+                timeout every cycle.
 
         Returns:
             Dictionary mapping recv_id to CAN message
         """
         responses: dict[int, can.Message] = {}
         expected_set = set(expected_recv_ids)
+        required = set(required_recv_ids) if required_recv_ids is not None else set(expected_recv_ids)
         start_time = time.time()
 
         if self.canbus is None:
             raise RuntimeError("CAN bus is not initialized.")
 
         try:
-            while len(responses) < len(expected_recv_ids) and (time.time() - start_time) < timeout:
+            while not required.issubset(responses.keys()) and (time.time() - start_time) < timeout:
                 # 100us poll timeout
                 msg = self.canbus.recv(timeout=PRECISE_TIMEOUT_SEC)
                 if msg and msg.arbitration_id in expected_set:
                     responses[msg.arbitration_id] = msg
-                    if len(responses) == len(expected_recv_ids):
-                        break
         except Exception as e:
             logger.debug(f"Error receiving responses: {e}")
 
@@ -567,7 +581,8 @@ class DamiaoMotorsBus(MotorsBusBase):
         }
         # Leftover responses from a previous collection window would otherwise
         # be matched below as acks of the commands sent in this cycle.
-        self._refresh_stale_drained += self._drain_pending_responses(recv_id_to_motor)
+        drained, _ = self._drain_pending_responses(recv_id_to_motor)
+        self._refresh_stale_drained += drained
 
         # Step 1: Send all MIT control commands
         for motor, (kp, kd, position_degrees, velocity_deg_per_sec, torque) in commands.items():
@@ -646,6 +661,7 @@ class DamiaoMotorsBus(MotorsBusBase):
                 "temp_mos": float(t_mos),
                 "temp_rotor": float(t_rotor),
             }
+            self._last_update_ts[motor] = time.monotonic()
         except Exception as e:
             logger.warning(f"Failed to decode response from {motor}: {e}")
 
@@ -751,7 +767,7 @@ class DamiaoMotorsBus(MotorsBusBase):
             )
             self.canbus.send(msg)
 
-    def _drain_pending_responses(self, recv_id_to_motor: dict[int, str]) -> int:
+    def _drain_pending_responses(self, recv_id_to_motor: dict[int, str]) -> tuple[int, set[str]]:
         """Consume frames already sitting in the RX buffer before a new request.
 
         Responses that arrive after a collection window has closed (e.g. MIT
@@ -763,31 +779,38 @@ class DamiaoMotorsBus(MotorsBusBase):
         matched after this point were produced by the current request.
 
         Returns:
-            Number of frames drained (matched to a motor or not).
+            Tuple of (frames drained, motor names whose state was updated by a
+            drained frame — their cache is now at most one cycle old).
         """
         if self.canbus is None:
             raise RuntimeError("CAN bus is not initialized.")
         drained = 0
+        updated: set[str] = set()
         try:
             while (msg := self.canbus.recv(timeout=0)) is not None:
                 drained += 1
                 motor = recv_id_to_motor.get(msg.arbitration_id)
                 if motor is not None:
                     self._process_response(motor, msg)
+                    updated.add(motor)
         except Exception as e:
             logger.debug(f"Error draining pending responses: {e}")
-        return drained
+        return drained, updated
 
     def _batch_refresh(self, motors: list[str]) -> set[str]:
         """Internal helper to refresh a list of motors and update cache.
 
-        Stale leftovers in the RX buffer are drained into the cache first, then
-        motors that do not answer within the collection window are re-requested
-        up to ``refresh_num_retry`` times. A motor that misses every window
-        ``refresh_giveup_after`` cycles in a row is no longer re-requested (one
-        request per cycle only) until it responds again, so a dead motor
-        degrades to the single-window cost instead of burning the whole retry
-        budget every cycle.
+        Stale leftovers in the RX buffer are drained into the cache first (a
+        drained ack is at most one cycle old). Refresh commands go to every
+        motor, but the collection window only blocks on motors that are not
+        latched; misses are re-requested up to ``refresh_num_retry`` times
+        (short windows) unless the drain already updated them. A motor that
+        misses ``refresh_giveup_after`` cycles in a row is latched — still
+        requested, never waited for — and re-arms only after
+        ``refresh_rearm_after`` consecutive responsive cycles. This keeps the
+        control loop at full rate through the multi-second all-DM4310 silence
+        bursts observed on-robot (2026-08-05) while the cache stays fresh via
+        drained MIT acks.
 
         Returns:
             The set of motor names that actually responded in this refresh cycle
@@ -795,40 +818,79 @@ class DamiaoMotorsBus(MotorsBusBase):
         """
         t_start = time.monotonic()
         recv_id_to_motor = {self._get_motor_recv_id(m): m for m in motors}
-        self._refresh_stale_drained += self._drain_pending_responses(recv_id_to_motor)
+        drained, fresh_via_drain = self._drain_pending_responses(recv_id_to_motor)
+        self._refresh_stale_drained += drained
 
+        # Latched motors (persistently unresponsive to refresh) are still
+        # requested every cycle but never waited for: on-robot measurement
+        # (2026-08-05) showed silence arrives in multi-second bursts of all
+        # four DM4310s, and waiting for them dragged the 200Hz teleop loop
+        # down to 70Hz. Their state keeps flowing via drained MIT acks.
+        latched = {m for m in motors if self._consecutive_drops[m] >= self.refresh_giveup_after}
         refreshed: set[str] = set()
-        pending = list(motors)
-        for attempt in range(1 + self.refresh_num_retry):
-            if attempt > 0:
-                pending = [m for m in pending if self._consecutive_drops[m] < self.refresh_giveup_after]
+
+        self._send_refresh_commands(motors)
+        blocking = [m for m in motors if m not in latched]
+        responses = self._recv_all_responses(
+            list(recv_id_to_motor.keys()),
+            timeout=MEDIUM_TIMEOUT_SEC,
+            required_recv_ids=[self._get_motor_recv_id(m) for m in blocking],
+        )
+        for motor in motors:
+            if (msg := responses.get(self._get_motor_recv_id(motor))) is not None:
+                self._process_response(motor, msg)
+                refreshed.add(motor)
+
+        # Re-request only motors that neither answered nor got fresh data via
+        # the drain (a drained ack is at most one cycle old — not worth
+        # stalling the loop over).
+        for _ in range(self.refresh_num_retry):
+            pending = [m for m in blocking if m not in refreshed and m not in fresh_via_drain]
             if not pending:
                 break
             self._send_refresh_commands(pending)
             responses = self._recv_all_responses(
-                [self._get_motor_recv_id(m) for m in pending], timeout=MEDIUM_TIMEOUT_SEC
+                [self._get_motor_recv_id(m) for m in pending], timeout=RETRY_TIMEOUT_SEC
             )
             for motor in pending:
                 if (msg := responses.get(self._get_motor_recv_id(motor))) is not None:
                     self._process_response(motor, msg)
                     refreshed.add(motor)
-                    if attempt > 0:
-                        self._refresh_recovered += 1
-            pending = [m for m in pending if m not in refreshed]
+                    self._refresh_recovered += 1
 
+        now = time.monotonic()
         for motor in motors:
             if motor in refreshed:
                 if self._consecutive_drops[motor] >= self.refresh_giveup_after:
-                    logger.info(f"{motor}: refresh responses resumed, re-requests re-enabled.")
-                self._consecutive_drops[motor] = 0
+                    # Re-arm only after a sustained clean streak: immediate
+                    # re-arming flapped during intermittent silence and paid
+                    # the full retry budget every second (measured 2026-08-05).
+                    self._consecutive_ok[motor] += 1
+                    if self._consecutive_ok[motor] >= self.refresh_rearm_after:
+                        self._consecutive_drops[motor] = 0
+                        self._consecutive_ok[motor] = 0
+                        logger.info(
+                            f"[{self.port}] {motor}: refresh responses stable for "
+                            f"{self.refresh_rearm_after} cycles, re-requests re-enabled."
+                        )
+                else:
+                    self._consecutive_drops[motor] = 0
             else:
+                self._consecutive_ok[motor] = 0
                 self._consecutive_drops[motor] += 1
-                self._refresh_drop_counts[motor] = self._refresh_drop_counts.get(motor, 0) + 1
+                if motor in fresh_via_drain:
+                    self._refresh_fresh_via_drain += 1
+                else:
+                    self._refresh_drop_counts[motor] = self._refresh_drop_counts.get(motor, 0) + 1
                 if self._consecutive_drops[motor] == self.refresh_giveup_after:
                     logger.warning(
-                        f"{motor}: no refresh response {self.refresh_giveup_after} cycles in a row. "
-                        "Disabling re-requests for it (one request per cycle) until it responds again."
+                        f"[{self.port}] {motor}: no refresh response {self.refresh_giveup_after} "
+                        "cycles in a row. Still requested each cycle but no longer waited for; "
+                        f"re-requests re-arm after {self.refresh_rearm_after} clean cycles."
                     )
+            ts = self._last_update_ts.get(motor, 0.0)
+            if ts > 0.0:
+                self._refresh_age_max = max(self._refresh_age_max, now - ts)
 
         self._refresh_cycles += 1
         elapsed = time.monotonic() - t_start
@@ -843,25 +905,35 @@ class DamiaoMotorsBus(MotorsBusBase):
         window = now - self._refresh_last_log
         if window < 1.0:
             return
-        if self._refresh_drop_counts or self._refresh_recovered or self._refresh_stale_drained:
+        if (
+            self._refresh_drop_counts
+            or self._refresh_recovered
+            or self._refresh_stale_drained
+            or self._refresh_fresh_via_drain
+        ):
             drops = ", ".join(
                 f"{m} {n}/{self._refresh_cycles}"
                 for m, n in sorted(self._refresh_drop_counts.items(), key=lambda kv: -kv[1])
             )
             avg_ms = 1000.0 * self._refresh_time_sum / max(self._refresh_cycles, 1)
             max_ms = 1000.0 * self._refresh_time_max
+            age_ms = 1000.0 * self._refresh_age_max
             level = logging.WARNING if self._refresh_drop_counts else logging.INFO
             logger.log(
                 level,
-                f"Batch refresh, last {window:.1f}s ({self._refresh_cycles} cycles, "
+                f"[{self.port}] Batch refresh, last {window:.1f}s ({self._refresh_cycles} cycles, "
                 f"avg {avg_ms:.1f}ms, max {max_ms:.1f}ms): drops [{drops or 'none'}] "
-                f"(kept last known state), recovered by re-request {self._refresh_recovered}, "
-                f"stale leftovers drained {self._refresh_stale_drained}.",
+                f"(kept last known state), fresh-via-drain {self._refresh_fresh_via_drain}, "
+                f"recovered by re-request {self._refresh_recovered}, "
+                f"stale leftovers drained {self._refresh_stale_drained}, "
+                f"oldest state {age_ms:.0f}ms.",
             )
         self._refresh_last_log = now
         self._refresh_drop_counts = {}
         self._refresh_recovered = 0
         self._refresh_stale_drained = 0
+        self._refresh_fresh_via_drain = 0
+        self._refresh_age_max = 0.0
         self._refresh_cycles = 0
         self._refresh_time_sum = 0.0
         self._refresh_time_max = 0.0

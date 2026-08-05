@@ -122,12 +122,41 @@ def test_batch_refresh_gives_up_on_persistently_silent_motor(fake_bus):
     assert fake.refresh_requests["gripper"] == bus.refresh_giveup_after * (1 + bus.refresh_num_retry)
     before = fake.refresh_requests["gripper"]
     bus._batch_refresh(list(bus.motors))
-    assert fake.refresh_requests["gripper"] == before + 1  # single request, no re-requests
-    # re-arms once the motor answers again
+    assert fake.refresh_requests["gripper"] == before + 1  # one request per cycle, no re-requests
+    # when it answers again, its ack lands after the window closed (the window
+    # no longer waits for it) and flows back via the drain on the NEXT cycle:
+    # request->collect pipelining with zero waiting, data at most 1 cycle old
     fake.silent_refreshes["gripper"] = 0
-    refreshed = bus._batch_refresh(list(bus.motors))
-    assert "gripper" in refreshed
-    assert bus._consecutive_drops["gripper"] == 0
+    fake.positions_deg["gripper"] = -30.0
+    bus._batch_refresh(list(bus.motors))  # ack enqueued after the window closes
+    bus._batch_refresh(list(bus.motors))  # drained here
+    assert bus._last_known_states["gripper"]["position"] == pytest.approx(-30.0, abs=0.1)
+    assert bus._consecutive_drops["gripper"] >= bus.refresh_giveup_after  # still latched (by design)
+
+
+def test_fresh_via_drain_skips_rerequest(fake_bus):
+    bus, fake = fake_bus
+    fake.silent_refreshes["gripper"] = -1  # refresh is never answered
+    fake.rx.append(fake.state_frame("gripper", 5.0))  # but an ack from last cycle is buffered
+    bus._batch_refresh(list(bus.motors))
+    # the drain already made gripper's data at most one cycle old: no re-requests
+    assert fake.refresh_requests["gripper"] == 1
+    assert bus._refresh_fresh_via_drain == 1
+    assert bus._last_known_states["gripper"]["position"] == pytest.approx(5.0, abs=0.1)
+
+
+def test_latched_motor_does_not_block_the_window(fake_bus):
+    bus, fake = fake_bus
+    fake.silent_refreshes["gripper"] = -1
+    for _ in range(bus.refresh_giveup_after):
+        bus._batch_refresh(list(bus.motors))  # latch it
+    t0 = time.monotonic()
+    bus._batch_refresh(list(bus.motors))
+    elapsed = time.monotonic() - t0
+    # the window closes when the responsive motors answer; gripper is still
+    # requested but its timeout is no longer paid
+    assert elapsed < 0.008
+    assert fake.refresh_requests["gripper"] == bus.refresh_giveup_after * (1 + bus.refresh_num_retry) + 1
 
 
 def test_stale_leftover_is_drained_not_matched(fake_bus):
