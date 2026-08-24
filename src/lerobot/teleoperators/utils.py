@@ -99,6 +99,10 @@ def make_teleoperator_from_config(config: TeleoperatorConfig) -> "Teleoperator":
         from .openarm_mini import OpenArmMini
 
         return OpenArmMini(config)
+    elif config.type == "openarm_leader_remote":
+        from .openarm_leader_remote import OpenArmLeaderRemote
+
+        return OpenArmLeaderRemote(config)
     elif config.type == "rebot_102_leader":
         from .rebot_102_leader import RebotArm102Leader
 
