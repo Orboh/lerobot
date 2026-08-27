@@ -253,6 +253,65 @@ class OpenArmLeaderRemote(Teleoperator):
         self._returned = dict(out)
         return out
 
+    def soft_move_to(self, pose: dict[str, float], duration_s: float = 2.0) -> bool:
+        """Ask the operator-side leader_agent to drive the real leader to ``pose``.
+
+        This is what makes the record 'a' key work end-to-end in remote mode:
+        ``drive_to_start_pose`` calls it exactly like the local leader's
+        ``soft_move_to``. The request rides the echo channel — idle whenever
+        the tracking loop is not running (the gate/cue phase, the only time
+        this is called), so RTT echoes cannot clobber it — and is resent every
+        0.3s with one ``cmd_id`` (the agent dedupes) until the incoming stream
+        settles at the target. Keys in ``pose`` come without the ``.pos``
+        suffix, matching the local leader's signature.
+        """
+        import zmq
+
+        if self._echo_socket is None:
+            return False
+        targets = {f"{k}.pos": float(v) for k, v in pose.items() if f"{k}.pos" in self.action_features}
+        if not targets:
+            return False
+
+        cmd_id = int(time.monotonic() * 1e6)
+        msg = json.dumps(
+            {
+                "cmd": "soft_move_to",
+                "cmd_id": cmd_id,
+                "pose": {k: float(v) for k, v in pose.items()},
+                "duration_s": float(duration_s),
+            }
+        )
+        # duration + margin for the command hop and the agent resuming its stream.
+        deadline = time.monotonic() + duration_s + 4.0
+        last_send = 0.0
+        tol_deg = 5.0  # settled = every joint within this of the target
+        while time.monotonic() < deadline:
+            now = time.monotonic()
+            if now - last_send > 0.3:
+                try:
+                    self._echo_socket.send_string(msg, flags=zmq.NOBLOCK)
+                except zmq.Again:
+                    pass
+                last_send = now
+            pkt = self._drain_latest()
+            if pkt is not None:
+                self._apply_packet(pkt)
+                worst = max(abs(self._target.get(k, 1e9) - v) for k, v in targets.items())
+                if worst <= tol_deg:
+                    # Seed the ramp state so tracking resumes without a jump.
+                    self._returned = dict(self._target)
+                    self._ramp_t0 = None
+                    self._stalled = False
+                    logger.info(f"{self} remote leader returned to the start pose (worst {worst:.1f}deg).")
+                    return True
+            time.sleep(0.02)
+        logger.warning(
+            f"{self} remote soft_move_to got no converged stream within {duration_s + 4.0:.1f}s — "
+            "return the leader by hand (the start-pose gate still verifies)."
+        )
+        return False
+
     def send_feedback(self, feedback: dict[str, Any]) -> None:
         raise NotImplementedError("Feedback is not implemented for OpenArm leader remote.")
 

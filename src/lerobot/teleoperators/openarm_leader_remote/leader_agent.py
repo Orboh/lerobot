@@ -141,6 +141,7 @@ def main(cfg: LeaderAgentConfig):
     seq = 0
     sent = 0
     dropped = 0
+    last_move_cmd_id = None
     rtts_ms: deque[float] = deque(maxlen=2000)
     window_t0 = time.perf_counter()
     window_loops = 0
@@ -161,16 +162,34 @@ def main(cfg: LeaderAgentConfig):
             except zmq.Again:
                 dropped += 1
 
-            # Drain RTT echoes (best-effort).
+            # Drain RTT echoes and control commands (best-effort).
+            pending_move = None
             while True:
                 try:
                     e = json.loads(echo.recv_string(zmq.NOBLOCK))
-                    if e.get("t_mono") is not None:
-                        rtts_ms.append((time.monotonic() - float(e["t_mono"])) * 1e3)
                 except zmq.Again:
                     break
                 except (json.JSONDecodeError, TypeError, ValueError):
                     break
+                if e.get("cmd") == "soft_move_to":
+                    pending_move = e
+                elif e.get("t_mono") is not None:
+                    rtts_ms.append((time.monotonic() - float(e["t_mono"])) * 1e3)
+
+            # Remote start-pose return (the record-side 'a' key). The follower
+            # host resends one cmd_id until the stream converges; execute each
+            # cmd_id once. Blocking is fine: the follower holds while our
+            # stream pauses, and the caller waits for convergence, not echoes.
+            if pending_move is not None and pending_move.get("cmd_id") != last_move_cmd_id:
+                last_move_cmd_id = pending_move.get("cmd_id")
+                move_pose = {k: float(v) for k, v in (pending_move.get("pose") or {}).items()}
+                move_dur = float(pending_move.get("duration_s") or 2.0)
+                if cfg.fake or leader is None or not move_pose:
+                    logger.info("Remote soft_move_to request ignored (fake mode or empty pose).")
+                else:
+                    logger.info(f"Remote soft_move_to: driving the leader to the start pose over {move_dur:.1f}s.")
+                    moved = leader.soft_move_to(move_pose, duration_s=move_dur)
+                    logger.info(f"Remote soft_move_to {'done' if moved else 'refused (torque-off leader?)'}.")
 
             window_loops += 1
             window_dt = time.perf_counter() - window_t0
