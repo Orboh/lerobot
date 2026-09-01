@@ -337,7 +337,13 @@ class DatasetWriter:
                 self._episodes_since_last_encoding = 0
 
         if episode_data is None:
-            self.clear_episode_buffer(delete_images=len(self._meta.image_keys) > 0)
+            # Success path: never touch the video temp dirs here. The encode
+            # worker deletes them after encoding, and batched encoding needs
+            # them alive until the batch runs. Only a discard (re-record) may
+            # delete them — see clear_episode_buffer(delete_video_frames=...).
+            self.clear_episode_buffer(
+                delete_images=len(self._meta.image_keys) > 0, delete_video_frames=False
+            )
 
     def _batch_save_episode_video(self, start_episode: int, end_episode: int | None = None) -> None:
         """Batch save videos for multiple episodes."""
@@ -523,18 +529,38 @@ class DatasetWriter:
         }
         return metadata
 
-    def clear_episode_buffer(self, delete_images: bool = True) -> None:
-        """Discard the current episode buffer and optionally delete temp images.
+    def clear_episode_buffer(self, delete_images: bool = True, delete_video_frames: bool = True) -> None:
+        """Discard the current episode buffer and optionally delete temp frames.
 
         Args:
             delete_images: If ``True``, remove temporary image directories
-                written for the current episode.
+                written for the current episode's image-dtype features.
+            delete_video_frames: If ``True``, also remove the temporary PNG
+                directories of video-dtype features. This is what makes a
+                discard (re-record) actually discard: frames are written as
+                ``frame_XXXXXX.png`` under a per-episode directory, and a
+                retake only overwrites up to its own length. Without this, a
+                retake shorter than the discarded take leaves the tail of the
+                discarded frames in place, the encoder encodes every file in
+                the directory, and the episode's video segment silently ends
+                up as long as the *longest* take while the data holds the
+                saved one (observed in the field: video/data length mismatch
+                on every episode whose discarded take was the longest).
+                The post-save cleanup passes ``False`` here because on the
+                success path the encoders own these directories — the encode
+                worker removes them after encoding, and batched encoding needs
+                them to survive until the batch runs.
         """
         # Cancel streaming encoder if active
         if self._streaming_encoder is not None:
             self._streaming_encoder.cancel_episode()
 
+        keys = []
         if delete_images:
+            keys += self._meta.image_keys
+        if delete_video_frames:
+            keys += self._meta.video_keys
+        if keys:
             if self.image_writer is not None:
                 self._wait_image_writer()
             episode_index = self.episode_buffer["episode_index"]
@@ -542,7 +568,7 @@ class DatasetWriter:
             # save_episode() mutates the buffer. Handle both types here.
             if isinstance(episode_index, np.ndarray):
                 episode_index = episode_index.item() if episode_index.size == 1 else episode_index[0]
-            for cam_key in self._meta.image_keys:
+            for cam_key in keys:
                 img_dir = self._get_image_file_dir(episode_index, cam_key)
                 if img_dir.is_dir():
                     shutil.rmtree(img_dir)
