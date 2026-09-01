@@ -51,6 +51,13 @@ class OpenArmLeader(Teleoperator):
 
     def __init__(self, config: OpenArmLeaderConfig):
         super().__init__(config)
+        if self.id is None:
+            raise ValueError(
+                f"{self.name} requires an explicit id "
+                "(e.g. --teleop.id=leader_right). Without one the calibration path "
+                "collapses to 'None.json', which every unnamed OpenArm device "
+                "would share regardless of side."
+            )
         self.config = config
 
         # Arm motors

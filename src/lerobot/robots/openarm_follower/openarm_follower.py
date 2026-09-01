@@ -54,6 +54,13 @@ class OpenArmFollower(Robot):
 
     def __init__(self, config: OpenArmFollowerConfig):
         super().__init__(config)
+        if self.id is None:
+            raise ValueError(
+                f"{self.name} requires an explicit id "
+                "(e.g. --robot.id=follower_right). Without one the calibration path "
+                "collapses to 'None.json', which every unnamed OpenArm device "
+                "would share regardless of side."
+            )
         self.config = config
 
         # Arm motors
