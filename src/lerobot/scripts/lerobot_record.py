@@ -679,7 +679,12 @@ def record(
             pending_start_pose: tuple[dict[str, float], str] | None = None
             # Set after a discarded take in manual mode: the retake needs the arm
             # returned again, and the cue for it has to run before recording.
-            cue_before_next_record = False
+            # Also true from the start in manual mode: without it, episode 0
+            # begins recording the instant align_on_connect finishes, with no
+            # "operator is actually holding the leader" confirmation -- any
+            # gravity-comp settling/drift in that gap gets captured as data.
+            # auto mode is untouched (its own no-keypress flow is unaffected).
+            cue_before_next_record = cfg.episode_advance == "manual"
             while recorded_episodes < cfg.dataset.num_episodes and not events["stop_recording"]:
                 if pending_start_pose is not None:
                     _log_start_pose_deviation(
