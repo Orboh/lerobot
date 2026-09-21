@@ -144,6 +144,40 @@ class BiOpenArmLeader(Teleoperator):
         self.left_arm.configure()
         self.right_arm.configure()
 
+    def soft_move_to(self, pose_deg: dict[str, float], duration_s: float = 2.0) -> bool:
+        """Softly drive both leaders to ``pose_deg`` (keys ``left_<motor>`` / ``right_<motor>``).
+
+        Splits the pose by side prefix and calls each arm's ``OpenArmLeader.soft_move_to``
+        in turn (left first, then right — the same order as ``connect``). Exists because
+        the record start-pose return (``drive_to_start_pose`` in lerobot.common.control_utils)
+        looks for ``soft_move_to`` on the teleop and passes the robot's ``.pos`` keys with
+        the suffix stripped, i.e. ``right_joint_1`` ... ``left_gripper``; without this method
+        the bimanual leader silently stays put and only the operator's hands can return it.
+
+        Keys without a side prefix are ambiguous for a bimanual leader and are ignored
+        with a warning (``BiOpenArmFollower.send_action`` drops them the same way). A side
+        with no keys is left untouched. Returns True only when every arm that received
+        keys returned True; returns False without moving anything when no side received
+        keys, or when an arm refuses (torque-off manual_control, see OpenArmLeader).
+        Torque is left on afterwards for the same reason as the single-arm version.
+        """
+        left_pose = {k.removeprefix("left_"): v for k, v in pose_deg.items() if k.startswith("left_")}
+        right_pose = {k.removeprefix("right_"): v for k, v in pose_deg.items() if k.startswith("right_")}
+        unprefixed = [k for k in pose_deg if not (k.startswith("left_") or k.startswith("right_"))]
+        if unprefixed:
+            logger.warning(
+                f"soft_move_to: ignoring keys without a left_/right_ prefix: {unprefixed}"
+            )
+        if not left_pose and not right_pose:
+            logger.warning("soft_move_to: no left_/right_ keys in pose; nothing to drive.")
+            return False
+        ok = True
+        if left_pose:
+            ok = self.left_arm.soft_move_to(left_pose, duration_s) and ok
+        if right_pose:
+            ok = self.right_arm.soft_move_to(right_pose, duration_s) and ok
+        return ok
+
     def setup_motors(self) -> None:
         raise NotImplementedError(
             "Motor ID configuration is typically done via manufacturer tools for CAN motors."
