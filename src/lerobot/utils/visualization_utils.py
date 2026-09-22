@@ -22,6 +22,15 @@ from lerobot.types import RobotAction, RobotObservation
 from .constants import ACTION, ACTION_PREFIX, OBS_PREFIX, OBS_STR
 from .import_utils import require_package
 
+# 2026-09-22 (Orboh, Thor monitor viewer): display-only shaping of camera images sent to rerun.
+# Upstream forces JPEG whenever display_ip/display_port are set (remote / web viewer bandwidth).
+# Encoding three 640x480 frames at the rerun default quality (95) every cycle on the record main
+# thread pushed the 30 Hz loop over budget, so the caller can downscale (integer stride) and lower
+# the JPEG quality for the *display copy only*. The dataset frames are untouched. Defaults keep the
+# upstream behavior (full size, quality 95).
+_DISPLAY_IMAGE_SCALE = max(1, int(os.environ.get("LEROBOT_DISPLAY_IMAGE_SCALE", "1")))
+_DISPLAY_JPEG_QUALITY = min(100, max(1, int(os.environ.get("LEROBOT_DISPLAY_JPEG_QUALITY", "95"))))
+
 
 def init_rerun(
     session_name: str = "lerobot_control_loop", ip: str | None = None, port: int | None = None
@@ -107,7 +116,13 @@ def log_rerun_data(
                     for i, vi in enumerate(arr):
                         rr.log(f"{key}_{i}", rr.Scalars(float(vi)))
                 else:
-                    img_entity = rr.Image(arr).compress() if compress_images else rr.Image(arr)
+                    if _DISPLAY_IMAGE_SCALE > 1 and arr.ndim == 3:
+                        arr = np.ascontiguousarray(arr[::_DISPLAY_IMAGE_SCALE, ::_DISPLAY_IMAGE_SCALE])
+                    img_entity = (
+                        rr.Image(arr).compress(jpeg_quality=_DISPLAY_JPEG_QUALITY)
+                        if compress_images
+                        else rr.Image(arr)
+                    )
                     rr.log(key, entity=img_entity, static=True)
 
     if action:

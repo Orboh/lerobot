@@ -173,7 +173,8 @@ from lerobot.utils.visualization_utils import init_rerun, log_rerun_data
 # recording with the monitor on) and buried the key prompts. It is summarized once per
 # LEROBOT_LOOP_WARN_S seconds instead (over-budget cycles / total, slowest Hz). Rerun images can
 # be logged every N-th frame with LEROBOT_DISPLAY_IMAGE_STRIDE (default 1 = every frame) when the
-# display still eats loop budget; joint scalars are logged every frame regardless.
+# display still eats loop budget; joint scalars are logged every frame regardless. Display-copy
+# downscale / JPEG quality live in visualization_utils (LEROBOT_DISPLAY_IMAGE_SCALE / _JPEG_QUALITY).
 _LOOP_WARN_S = float(os.environ.get("LEROBOT_LOOP_WARN_S", "1"))
 _DISPLAY_IMAGE_STRIDE = max(1, int(os.environ.get("LEROBOT_DISPLAY_IMAGE_STRIDE", "1")))
 
@@ -538,18 +539,16 @@ def record(
     logging.info(pformat(asdict(cfg)))
     if cfg.display_data:
         init_rerun(session_name="recording", ip=cfg.display_ip, port=cfg.display_port)
-    # A remote viewer (DISPLAY_IP=<another PC>) gets JPEG to save bandwidth. A loopback target (the
-    # Thor monitor viewer, DISPLAY_IP=127.0.0.1) does not need it: encoding three VGA frames per cycle
-    # on the main thread pushed the 30 Hz record loop over budget (2026-09-22 dry5: 44 over-budget
-    # cycles in 8 s, 25-29 Hz). Force compression only for a non-loopback target; otherwise honor
-    # cfg.display_compressed_images.
-    _remote_display = (
-        cfg.display_data
-        and cfg.display_ip is not None
-        and cfg.display_port is not None
-        and cfg.display_ip not in ("127.0.0.1", "localhost", "::1")
+    # Upstream rule kept as is: a display_ip/display_port target (remote or web viewer, and the Thor
+    # monitor viewer reached via 127.0.0.1) gets JPEG-compressed images. The per-cycle encode cost of
+    # three 640x480 frames at quality 95 pushed the 30 Hz loop over budget (2026-09-22 dry5), so the
+    # display copy can be downscaled / lowered in quality with LEROBOT_DISPLAY_IMAGE_SCALE and
+    # LEROBOT_DISPLAY_JPEG_QUALITY (see visualization_utils.log_rerun_data); the dataset is untouched.
+    display_compressed_images = (
+        True
+        if (cfg.display_data and cfg.display_ip is not None and cfg.display_port is not None)
+        else cfg.display_compressed_images
     )
-    display_compressed_images = True if _remote_display else cfg.display_compressed_images
 
     robot = make_robot_from_config(cfg.robot)
     teleop = make_teleoperator_from_config(cfg.teleop) if cfg.teleop is not None else None
