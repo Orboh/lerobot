@@ -88,6 +88,7 @@ lerobot-record \\
 
 import json
 import logging
+import os
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -166,6 +167,15 @@ from lerobot.utils.utils import (
     log_say,
 )
 from lerobot.utils.visualization_utils import init_rerun, log_rerun_data
+
+# 2026-09-22 (bimanual collection on Thor, operator-panel console): the stock per-cycle
+# "Record loop is running slower" warning fires on every over-budget cycle (~6 lines/s while
+# recording with the monitor on) and buried the key prompts. It is summarized once per
+# LEROBOT_LOOP_WARN_S seconds instead (over-budget cycles / total, slowest Hz). Rerun images can
+# be logged every N-th frame with LEROBOT_DISPLAY_IMAGE_STRIDE (default 1 = every frame) when the
+# display still eats loop budget; joint scalars are logged every frame regardless.
+_LOOP_WARN_S = float(os.environ.get("LEROBOT_LOOP_WARN_S", "1"))
+_DISPLAY_IMAGE_STRIDE = max(1, int(os.environ.get("LEROBOT_DISPLAY_IMAGE_STRIDE", "1")))
 
 
 @dataclass
@@ -416,7 +426,12 @@ def record_loop(
 
     no_action_count = 0
     timestamp = 0
+    loop_cycles = 0  # for the rerun image stride
+    window_cycles = 0
+    slow_cycles = 0
+    slow_min_hz = float("inf")
     start_episode_t = time.perf_counter()
+    slow_window_t = start_episode_t
     while timestamp < control_time_s:
         start_loop_t = time.perf_counter()
 
@@ -476,17 +491,36 @@ def record_loop(
             dataset.add_frame(frame)
 
         if display_data:
+            if _DISPLAY_IMAGE_STRIDE > 1 and loop_cycles % _DISPLAY_IMAGE_STRIDE:
+                # off-stride frame: scalars only (images are 3-D arrays)
+                obs_for_display = {k: v for k, v in obs_processed.items() if getattr(v, "ndim", 0) != 3}
+            else:
+                obs_for_display = obs_processed
             log_rerun_data(
-                observation=obs_processed, action=action_values, compress_images=display_compressed_images
+                observation=obs_for_display, action=action_values, compress_images=display_compressed_images
             )
+        loop_cycles += 1
 
         dt_s = time.perf_counter() - start_loop_t
 
         sleep_time_s: float = control_interval - dt_s
+        window_cycles += 1
         if sleep_time_s < 0:
-            logging.warning(
-                f"Record loop is running slower ({1 / dt_s:.1f} Hz) than the target FPS ({fps} Hz). Dataset frames might be dropped and robot control might be unstable. Common causes are: 1) Camera FPS not keeping up 2) Policy inference taking too long 3) CPU starvation"
-            )
+            slow_cycles += 1
+            slow_min_hz = min(slow_min_hz, 1 / dt_s)
+        now_t = time.perf_counter()
+        if now_t - slow_window_t >= _LOOP_WARN_S:
+            if slow_cycles:
+                logging.warning(
+                    f"Record loop over budget in {slow_cycles}/{window_cycles} cycles over the last "
+                    f"{now_t - slow_window_t:.1f}s (slowest {slow_min_hz:.1f} Hz, target {fps} Hz). "
+                    "Common causes: camera FPS not keeping up, rerun image logging (JPEG encode / "
+                    "LEROBOT_DISPLAY_IMAGE_STRIDE), image writer or CPU starvation."
+                )
+            window_cycles = 0
+            slow_cycles = 0
+            slow_min_hz = float("inf")
+            slow_window_t = now_t
 
         precise_sleep(max(sleep_time_s, 0.0))
 
@@ -504,11 +538,18 @@ def record(
     logging.info(pformat(asdict(cfg)))
     if cfg.display_data:
         init_rerun(session_name="recording", ip=cfg.display_ip, port=cfg.display_port)
-    display_compressed_images = (
-        True
-        if (cfg.display_data and cfg.display_ip is not None and cfg.display_port is not None)
-        else cfg.display_compressed_images
+    # A remote viewer (DISPLAY_IP=<another PC>) gets JPEG to save bandwidth. A loopback target (the
+    # Thor monitor viewer, DISPLAY_IP=127.0.0.1) does not need it: encoding three VGA frames per cycle
+    # on the main thread pushed the 30 Hz record loop over budget (2026-09-22 dry5: 44 over-budget
+    # cycles in 8 s, 25-29 Hz). Force compression only for a non-loopback target; otherwise honor
+    # cfg.display_compressed_images.
+    _remote_display = (
+        cfg.display_data
+        and cfg.display_ip is not None
+        and cfg.display_port is not None
+        and cfg.display_ip not in ("127.0.0.1", "localhost", "::1")
     )
+    display_compressed_images = True if _remote_display else cfg.display_compressed_images
 
     robot = make_robot_from_config(cfg.robot)
     teleop = make_teleoperator_from_config(cfg.teleop) if cfg.teleop is not None else None
