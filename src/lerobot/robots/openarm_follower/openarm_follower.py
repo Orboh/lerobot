@@ -15,6 +15,7 @@
 # limitations under the License.
 
 import logging
+import os
 import time
 from functools import cached_property
 from typing import Any
@@ -41,6 +42,13 @@ from .config_openarm_follower import (
 )
 
 logger = logging.getLogger(__name__)
+
+# 2026-09-22 (Itabashi): the RealSense D405/D435i on the GenesysLogic USB3 hub hit transient USB
+# endpoint stalls (kernel logs USBDEVFS_CLEAR_HALT; 180-280 per camera since 2026-09-21). One
+# stall leaves the latest frame >500 ms old for a moment and the default read_latest() raises,
+# which kills the whole record session. Tolerate a stale frame up to this many ms (with a warning
+# per event so stalls stay countable in console.log). A truly hung camera still raises.
+_CAM_MAX_AGE_MS = int(os.environ.get("OPENARM_CAM_MAX_AGE_MS", "2000"))
 
 
 class OpenArmFollower(Robot):
@@ -354,7 +362,13 @@ class OpenArmFollower(Robot):
         # Capture images from cameras
         for cam_key, cam in self.cameras.items():
             start = time.perf_counter()
-            obs_dict[cam_key] = cam.read_latest()
+            try:
+                obs_dict[cam_key] = cam.read_latest()
+            except TimeoutError as e:
+                # Transient USB stall (see _CAM_MAX_AGE_MS): reuse the stale frame instead of
+                # aborting the session; re-raises if the frame is older than the tolerance.
+                logger.warning(f"{self} {cam_key} stale frame, tolerating up to {_CAM_MAX_AGE_MS} ms: {e}")
+                obs_dict[cam_key] = cam.read_latest(max_age_ms=_CAM_MAX_AGE_MS)
             dt_ms = (time.perf_counter() - start) * 1e3
             logger.debug(f"{self} read {cam_key}: {dt_ms:.1f}ms")
 
