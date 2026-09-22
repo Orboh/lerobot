@@ -49,7 +49,10 @@ def init_rerun(
 
     batch_size = os.getenv("RERUN_FLUSH_NUM_BYTES", "8000")
     os.environ["RERUN_FLUSH_NUM_BYTES"] = batch_size
-    rr.init(session_name)
+    # 2026-09-22 (Orboh): a fixed recording id (env LEROBOT_RERUN_RECORDING_ID) lets repeated record runs
+    # log into one recording of a resident viewer instead of opening a new recording per process
+    # (the viewer brings the newest arrival to the front, hiding the live stream behind an old one).
+    rr.init(session_name, recording_id=os.environ.get("LEROBOT_RERUN_RECORDING_ID") or None)
     memory_limit = os.getenv("LEROBOT_RERUN_MEMORY_LIMIT", "10%")
     if ip and port:
         rr.connect_grpc(url=f"rerun+http://{ip}:{port}/proxy")
