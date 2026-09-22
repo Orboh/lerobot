@@ -59,15 +59,14 @@ def is_headless():
         import pynput  # noqa
 
         return False
-    except Exception:
-        print(
-            "Error trying to import pynput. Switching to headless mode. "
-            "As a result, the video stream from the cameras won't be shown, "
-            "and you won't be able to change the control flow with keyboards. "
-            "For more info, see traceback below.\n"
+    except Exception as e:
+        # No GUI (plain SSH / DISPLAY unset): this is the normal case on Thor, not an error.
+        # Control keys are read from the terminal's stdin instead (see _init_stdin_key_listener).
+        logging.info(
+            "GUI なし（headless）: 収集のキー（→ ← esc a）は端末の stdin から読む。"
+            f"映像はモニターの rerun へ流す。（pynput import failed: {type(e).__name__}）"
         )
-        traceback.print_exc()
-        print()
+        logging.debug("pynput import traceback", exc_info=True)
         return True
 
 
@@ -457,6 +456,13 @@ def teleop_can_be_driven(teleop) -> bool:
     return not getattr(teleop.config, "manual_control", False)
 
 
+def _banner(title: str, keys: str) -> None:
+    """Operator-facing state banner: plain print so it stands out from the INFO stream
+    (the per-bus Damiao stats lines bury a one-line prompt within seconds)."""
+    line = "=" * 72
+    print(f"\n{line}\n  {title}\n  {keys}\n{line}\n", flush=True)
+
+
 def start_pose_deviation(current_pos: dict, target_pos: dict) -> dict[str, float]:
     """Absolute per-joint deviation (deg) between the current pose and a start pose.
 
@@ -741,6 +747,10 @@ def wait_for_episode_cue(
                     verify_deg,
                 )
                 homed = False
+                _banner(
+                    f"戻し損ね: {worst} が {deviation[worst]:.1f}° ずれている（録画していない）",
+                    "a もう一度戻す   → ここから録画を強行   esc 終了",
+                )
             elif moved or worst is None:
                 homed = True
                 log_say("Arm returned. Restore the scene, then press the right arrow", play_sounds)
@@ -772,10 +782,18 @@ def wait_for_episode_cue(
                     "Waiting: press 'a' to return both arms to the start pose, "
                     "right arrow to start without returning, left arrow to re-record, esc to stop."
                 )
+                _banner(
+                    "待機中（録画していない）",
+                    "→ 開始   a 両腕を開始姿勢へ戻す（手を引く）   ← 直前のテイクを破棄   esc 終了",
+                )
             else:
                 logging.info(
                     "Waiting: arm is at the start pose. Restore the scene, then press the right arrow "
                     "to start ('a' returns it again, esc stops)."
+                )
+                _banner(
+                    "待機中: 腕は開始姿勢に戻っている（録画していない）",
+                    "シーンを整えて → で開始（前のテイクが確定保存）   a もう一度戻す   esc 終了",
                 )
             prompted_at = now
             prompted_state = state

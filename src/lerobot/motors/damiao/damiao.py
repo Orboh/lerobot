@@ -17,6 +17,7 @@
 # https://github.com/cmjang/DM_Control_Python
 
 import logging
+import os
 import time
 from contextlib import contextmanager
 from copy import deepcopy
@@ -72,6 +73,11 @@ class MotorState(TypedDict):
     torque: float
     temp_mos: float
     temp_rotor: float
+
+
+# Healthy-window cadence of the per-bus "Batch refresh" stats line (seconds). Abnormal windows
+# still log every second. Override with DAMIAO_STATS_LOG_S.
+_STATS_QUIET_S = float(os.environ.get("DAMIAO_STATS_LOG_S", "10"))
 
 
 class DamiaoMotorsBus(MotorsBusBase):
@@ -900,10 +906,21 @@ class DamiaoMotorsBus(MotorsBusBase):
         return refreshed
 
     def _maybe_log_refresh_stats(self) -> None:
-        """Flush aggregated drop/recovery/staleness counters at most once per second."""
+        """Flush aggregated drop/recovery/staleness counters.
+
+        Abnormal windows (drops / re-requests / fresh-via-drain) log at most once per second so
+        a fault is visible immediately. Healthy windows log at most once per
+        DAMIAO_STATS_LOG_S seconds (default 10): four buses at 1 Hz buried the operator prompts
+        within seconds on the collection console (Itabashi 2026-09-22).
+        """
         now = time.monotonic()
         window = now - self._refresh_last_log
         if window < 1.0:
+            return
+        healthy = not (
+            self._refresh_drop_counts or self._refresh_recovered or self._refresh_fresh_via_drain
+        )
+        if healthy and window < _STATS_QUIET_S:
             return
         if (
             self._refresh_drop_counts

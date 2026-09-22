@@ -102,6 +102,7 @@ from lerobot.common.control_utils import (
     init_keyboard_listener,
     is_headless,
     sanity_check_dataset_robot_compatibility,
+    _banner,
     wait_for_episode_cue,
     wait_for_start_pose,
 )
@@ -747,6 +748,10 @@ def record(
                         break
 
                 log_say(f"Recording episode {dataset.num_episodes}", cfg.play_sounds)
+                _banner(
+                    f"録画中 episode {dataset.num_episodes}（{cfg.dataset.episode_time_s:.0f} 秒で自動終了）",
+                    "→ 終了（テイクは保留）   ← 破棄して終了   esc 終了   a は予約（終了直後に戻す）",
+                )
                 record_loop(
                     robot=robot,
                     events=events,
