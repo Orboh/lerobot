@@ -107,6 +107,29 @@ class OpenArmLeaderConfigBase:
     initial_pose_path: str | None = None
     initial_pose_deg: dict[str, float] | None = None
 
+    # --- Frozen side (this leader does not drive its follower) -----------------
+    # When set, get_action() stops reading this leader and returns a constant
+    # action built from this pose file, so the follower is held there by the
+    # recording loop itself.
+    #
+    # Why: in the v2 Itabashi setup one arm does not perform the task — it holds
+    # a wrist camera aimed at the place target while the other arm works. Holding
+    # it with a second process is not possible (record already owns that CAN bus
+    # and both would command the same motors), and having a person hold the
+    # leader for 50 episodes makes the camera pose drift with their grip.
+    # Freezing the action keeps a single owner of the bus and writes a constant
+    # right-arm action into the dataset, which is what the policy should learn.
+    #
+    # The leader arm stays connected and gravity-compensated; its readings are
+    # simply ignored. Point this at the same YAML as initial_pose_path so the
+    # startup alignment and the held pose agree.
+    frozen_pose_path: str | None = None
+
+    # Gripper position (deg) held while frozen. The startup alignment always pins
+    # the gripper to the calibration zero (closed), but a closed hand can block
+    # the wrist camera, so the held value is separate. -65 is fully open.
+    frozen_gripper_deg: float = 0.0
+
     # When True, expose `.vel` and `.torque` per motor in action features.
     # Default False for compatibility with the position-only openarm_mini teleoperator.
     use_velocity_and_torque: bool = False

@@ -86,6 +86,8 @@ class OpenArmLeader(Teleoperator):
         self._grav_model = None
         self._grav_data = None
         self._grav_qidx: list[int] = []
+        # 凍結側（この leader は follower を駆動せず、固定姿勢を返し続ける）。connect で組む。
+        self._frozen_action: dict[str, Any] | None = None
         self._grav_vidx: list[int] = []
         self._arm_motor_names: list[str] = []
 
@@ -181,12 +183,47 @@ class OpenArmLeader(Teleoperator):
             else:
                 logger.info("align_on_connect skipped: manual_control keeps torque disabled.")
 
+        self._frozen_action = self._build_frozen_action()
+        if self._frozen_action is not None:
+            held = "  ".join(
+                f"{k.removesuffix('.pos')}={v:.1f}"
+                for k, v in self._frozen_action.items()
+                if k.endswith(".pos")
+            )
+            logger.info(f"{self} frozen: この腕は leader を読まず固定姿勢を返し続ける -> {held}")
+
         logger.info(f"{self} connected.")
 
     @property
     def is_calibrated(self) -> bool:
         """Check if teleoperator is calibrated."""
         return self.bus.is_calibrated
+
+    def _build_frozen_action(self) -> dict[str, Any] | None:
+        """Constant action for a frozen side, or None when this side is live.
+
+        Built once at connect so the hot loop stays a dict copy. Arm joints come
+        from the pose file (clamped to this side's limits, same resolution the
+        startup alignment uses, so the arm is already there when recording
+        starts); the gripper comes from frozen_gripper_deg because the alignment
+        always pins it closed.
+        """
+        if not self.config.frozen_pose_path:
+            return None
+        pose = resolve_initial_pose(
+            initial_pose_path=self.config.frozen_pose_path,
+            joint_limits=self._side_joint_limits(),
+        )
+        action: dict[str, Any] = {}
+        for motor in self.bus.motors:
+            if motor == "gripper":
+                action["gripper.pos"] = float(self.config.frozen_gripper_deg)
+            else:
+                action[f"{motor}.pos"] = float(pose[motor])
+            if self.config.use_velocity_and_torque:
+                action[f"{motor}.vel"] = 0.0
+                action[f"{motor}.torque"] = 0.0
+        return action
 
     def _side_joint_limits(self) -> dict[str, tuple[float, float]]:
         """Physical joint limits for this leader's side.
@@ -480,6 +517,12 @@ class OpenArmLeader(Teleoperator):
 
         Reads all motor states (pos/vel/torque) in one CAN refresh cycle.
         """
+        # 凍結側は leader を読まない。固定姿勢をそのまま action にするので、follower は
+        # record のループ自身に保持される（別プロセスで保持すると同じ CAN バスを
+        # 2 つが取り合うことになり成立しない）。
+        if self._frozen_action is not None:
+            return dict(self._frozen_action)
+
         start = time.perf_counter()
 
         action_dict: dict[str, Any] = {}
