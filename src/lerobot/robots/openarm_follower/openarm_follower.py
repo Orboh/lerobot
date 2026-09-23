@@ -26,6 +26,7 @@ from lerobot.motors.damiao import DamiaoMotorsBus
 from lerobot.motors.damiao.damiao_alignment import (
     check_start_position,
     resolve_initial_pose,
+    resolve_initial_pose_sequence,
     should_rezero_on_connect,
     soft_move_to_position,
 )
@@ -197,12 +198,15 @@ class OpenArmFollower(Robot):
         # the official default; it is clamped into joint_limits. Placed after
         # set_zero_position so the pose targets use the fresh zero.
         if self.config.align_on_connect:
-            goal = resolve_initial_pose(
+            # One soft move per pose: the optional ``waypoints:`` in the start-pose
+            # file come first, the captured pose last. Without waypoints this is a
+            # single move, identical to before.
+            for goal in resolve_initial_pose_sequence(
                 initial_pose_deg=self.config.initial_pose_deg,
                 initial_pose_path=self.config.initial_pose_path,
                 joint_limits=self.config.joint_limits,
-            )
-            soft_move_to_position(self.bus, goal, self.config.align_duration_s)
+            ):
+                soft_move_to_position(self.bus, goal, self.config.align_duration_s)
 
         logger.info(f"{self} connected.")
 

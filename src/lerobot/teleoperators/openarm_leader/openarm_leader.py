@@ -25,6 +25,7 @@ from lerobot.motors.damiao import DamiaoMotorsBus
 from lerobot.motors.damiao.damiao_alignment import (
     check_start_position,
     resolve_initial_pose,
+    resolve_initial_pose_sequence,
     should_rezero_on_connect,
     soft_move_to_position,
 )
@@ -160,20 +161,23 @@ class OpenArmLeader(Teleoperator):
         # injection takes over and makes it weightless again.
         if self.config.align_on_connect:
             if applies_torque:
-                goal = resolve_initial_pose(
-                    initial_pose_deg=self.config.initial_pose_deg,
-                    initial_pose_path=self.config.initial_pose_path,
-                    joint_limits=self._side_joint_limits(),
-                )
                 # In gravity mode, feed forward G(q) during the ramp so a raised
                 # pose is actually reached and held (soft gains alone sag under
                 # gravity at a lifted pose). Evaluated at the interpolated target.
                 torque_ff_fn = (
                     self._gravity_tau_from_positions if self.config.gravity_compensation else None
                 )
-                soft_move_to_position(
-                    self.bus, goal, self.config.align_duration_s, torque_ff_fn=torque_ff_fn
-                )
+                # One soft move per pose: the optional ``waypoints:`` in the
+                # start-pose file come first, the captured pose last. Without
+                # waypoints this is a single move, identical to before.
+                for goal in resolve_initial_pose_sequence(
+                    initial_pose_deg=self.config.initial_pose_deg,
+                    initial_pose_path=self.config.initial_pose_path,
+                    joint_limits=self._side_joint_limits(),
+                ):
+                    soft_move_to_position(
+                        self.bus, goal, self.config.align_duration_s, torque_ff_fn=torque_ff_fn
+                    )
             else:
                 logger.info("align_on_connect skipped: manual_control keeps torque disabled.")
 

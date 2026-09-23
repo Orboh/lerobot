@@ -252,7 +252,61 @@ def load_initial_pose_file(path: str) -> dict[str, float]:
         data = data["joints"]
     if not isinstance(data, dict):
         raise ValueError(f"initial_pose file {resolved!r} must be a mapping of joint -> degrees.")
-    return {str(k): float(v) for k, v in data.items()}
+    # Skip structured values (lists/dicts) so the same file can also carry the
+    # optional ``waypoints:`` list read by load_initial_pose_waypoints. Scalars
+    # still go through float(), so a typo in a joint value raises as before.
+    return {str(k): float(v) for k, v in data.items() if not isinstance(v, (list, dict))}
+
+
+WAYPOINTS_KEY = "waypoints"
+
+
+def load_initial_pose_waypoints(path: str) -> list[dict[str, float]]:
+    """Load the optional intermediate poses of a start-pose YAML.
+
+    A start pose is reached by linear interpolation in joint space from wherever
+    the arm currently is (see ``soft_move_to_position``). Nothing inspects that
+    straight line, so a target that is fine in isolation can still sweep the arm
+    through the table on the way in. ``waypoints:`` lets the file name poses to
+    pass through first, in order, each one its own soft move.
+
+    Format (all keys optional, degrees, same joint names as the flat mapping)::
+
+        waypoints:
+          - {joint_1: -69.38, joint_4: 74.73}
+        joint_1: 24.7
+        ...
+
+    Joints a waypoint leaves out keep their final-pose value, so a waypoint only
+    has to name what must differ on the way. Returns [] when the file has no
+    ``waypoints:`` key, which is the case for every pose captured so far.
+    """
+    import yaml
+
+    resolved = os.path.expanduser(path)
+    if not os.path.isfile(resolved):
+        raise FileNotFoundError(f"initial_pose_path not found: {resolved!r}.")
+    with open(resolved) as f:
+        data = yaml.safe_load(f) or {}
+    if isinstance(data, dict) and isinstance(data.get("joints"), dict) and WAYPOINTS_KEY not in data:
+        data = data["joints"]
+    if not isinstance(data, dict):
+        return []
+    raw = data.get(WAYPOINTS_KEY)
+    if raw is None:
+        return []
+    if not isinstance(raw, list):
+        raise ValueError(
+            f"initial_pose file {resolved!r}: {WAYPOINTS_KEY!r} must be a list of joint mappings."
+        )
+    out: list[dict[str, float]] = []
+    for i, wp in enumerate(raw):
+        if not isinstance(wp, dict):
+            raise ValueError(
+                f"initial_pose file {resolved!r}: {WAYPOINTS_KEY}[{i}] must be a mapping of joint -> degrees."
+            )
+        out.append({str(k): float(v) for k, v in wp.items() if not isinstance(v, (list, dict))})
+    return out
 
 
 def resolve_initial_pose(
@@ -297,3 +351,60 @@ def resolve_initial_pose(
                 merged[motor] = clamped
 
     return merged
+
+
+def resolve_initial_pose_sequence(
+    initial_pose_deg: dict[str, float] | None = None,
+    initial_pose_path: str | None = None,
+    joint_limits: dict[str, tuple[float, float]] | None = None,
+    keep_gripper_zero: bool = True,
+) -> list[dict[str, float]]:
+    """Resolve the startup alignment as an ordered list of poses to pass through.
+
+    The last element is what ``resolve_initial_pose`` returns; anything before it
+    comes from the file's optional ``waypoints:`` list. Each element is a full
+    pose, clamped into ``joint_limits``, meant for one ``soft_move_to_position``
+    call. Callers just loop over the result.
+
+    Why: the alignment move interpolates linearly in joint space from the arm's
+    current pose to the target, and no one checks that line for collisions. A
+    reachable target can still drag the arm through the table on the way there
+    (2026-09-23 Itabashi, right arm going to the v2 camera-holding pose). Naming
+    an intermediate pose turns one long sweep into two short ones that each stay
+    in known-safe space.
+
+    Waypoints are only read from ``initial_pose_path``. An explicit
+    ``initial_pose_deg`` override is taken at face value and moved to directly,
+    which keeps the programmatic callers unchanged.
+
+    Joints a waypoint omits are filled from the final pose, not from the official
+    default, so a partial waypoint moves only the joints it names instead of
+    yanking the rest somewhere nobody asked for.
+    """
+    final = resolve_initial_pose(
+        initial_pose_deg=initial_pose_deg,
+        initial_pose_path=initial_pose_path,
+        joint_limits=joint_limits,
+        keep_gripper_zero=keep_gripper_zero,
+    )
+    if initial_pose_deg is not None or not initial_pose_path:
+        return [final]
+
+    sequence: list[dict[str, float]] = []
+    for wp in load_initial_pose_waypoints(initial_pose_path):
+        merged = dict(final)
+        merged.update({k: float(v) for k, v in wp.items() if k in merged})
+        sequence.append(
+            resolve_initial_pose(
+                initial_pose_deg=merged,
+                joint_limits=joint_limits,
+                keep_gripper_zero=keep_gripper_zero,
+            )
+        )
+    sequence.append(final)
+    if len(sequence) > 1:
+        logger.info(
+            f"initial pose: {len(sequence) - 1} waypoint(s) before the final pose "
+            f"(from {initial_pose_path})"
+        )
+    return sequence
