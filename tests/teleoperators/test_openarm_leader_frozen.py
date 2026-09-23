@@ -36,6 +36,7 @@ MOTORS = [f"joint_{i}" for i in range(1, 8)] + ["gripper"]
 
 class _Bus:
     motors = dict.fromkeys(MOTORS)
+    is_connected = True  # get_action は接続チェックのデコレータを通る
 
 
 def _leader(**kw):
@@ -97,3 +98,21 @@ def test_frozen_action_is_clamped_to_side_limits(tmp_path):
     p.write_text("joint_6: 999.0\ngripper: 0.0\n")
     action = _leader(frozen_pose_path=str(p))._build_frozen_action()
     assert action["joint_6.pos"] == 45.0  # RIGHT_DEFAULT_JOINTS_LIMITS joint_6 = (-45, 45)
+
+
+def test_frozen_get_action_still_injects_gravity(pose_file):
+    """Freezing the action must not silently drop the leader's own gravity comp."""
+    obj = _leader(frozen_pose_path=pose_file, gravity_compensation=True)
+    obj._frozen_action = obj._build_frozen_action()
+    calls = []
+    obj._inject_gravity = lambda: calls.append(1) or {}
+    out = obj.get_action()
+    assert calls == [1]
+    assert out["joint_1.pos"] == 24.7
+
+
+def test_frozen_get_action_skips_gravity_when_off(pose_file):
+    obj = _leader(frozen_pose_path=pose_file, gravity_compensation=False)
+    obj._frozen_action = obj._build_frozen_action()
+    obj._inject_gravity = lambda: (_ for _ in ()).throw(AssertionError("must not be called"))
+    assert obj.get_action()["joint_1.pos"] == 24.7

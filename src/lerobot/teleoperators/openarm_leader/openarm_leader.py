@@ -521,6 +521,12 @@ class OpenArmLeader(Teleoperator):
         # record のループ自身に保持される（別プロセスで保持すると同じ CAN バスを
         # 2 つが取り合うことになり成立しない）。
         if self._frozen_action is not None:
+            # 凍結側でも leader 本体の重力補償は続ける。_inject_gravity は「読み取り」と
+            # 「G(q) の注入」が一体なので、読みを省くと右 leader が無補償になり、最後に
+            # 送った整列の保持トルクを持ったまま放置される（TIMEOUT=0 で最終トルクを
+            # 保持し続ける既知の挙動）。読んだ値は捨てる。
+            if self.config.gravity_compensation:
+                self._inject_gravity()
             return dict(self._frozen_action)
 
         start = time.perf_counter()
