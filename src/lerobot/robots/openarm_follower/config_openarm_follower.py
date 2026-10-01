@@ -131,6 +131,13 @@ class OpenArmFollowerConfigBase:
     # tracking command.
     align_on_connect: bool = True
     align_duration_s: float = 2.2
+    # Gravity feed-forward during the startup alignment only (teleop/rollout control is
+    # unchanged). Without it the soft alignment gains sag ~5-6 deg under gravity and the
+    # arm snaps up when the loop starts. Point at the dynamics URDF
+    # (openarm-orboh urdf/openarm_v10_bimanual.urdf) to enable; None keeps the old
+    # behaviour. Uses ``side``. Scale multiplies G(q).
+    align_gravity_urdf_path: str | None = None
+    align_gravity_scale: float = 1.0
 
     # Startup alignment target. By default the arm aligns to the official
     # OPENARM_INITIAL_POSITION_DEG (all joints 0, elbow 36 deg). To start teleop

@@ -199,6 +199,15 @@ class OpenArmFollower(Robot):
         # the official default; it is clamped into joint_limits. Placed after
         # set_zero_position so the pose targets use the fresh zero.
         if self.config.align_on_connect:
+            torque_ff_fn = None
+            if self.config.align_gravity_urdf_path:
+                from lerobot.motors.damiao.openarm_gravity import OpenArmGravityModel
+
+                if self.config.side not in ("left", "right"):
+                    raise ValueError("align_gravity_urdf_path needs side='left' or 'right'")
+                torque_ff_fn = OpenArmGravityModel(
+                    self.config.align_gravity_urdf_path, self.config.side, self.config.align_gravity_scale
+                ).torque
             # One soft move per pose: the optional ``waypoints:`` in the start-pose
             # file come first, the captured pose last. Without waypoints this is a
             # single move, identical to before.
@@ -211,6 +220,7 @@ class OpenArmFollower(Robot):
                     self.bus,
                     goal,
                     self.config.align_duration_s,
+                    torque_ff_fn=torque_ff_fn,
                     max_speed_dps=load_initial_pose_align_speed(self.config.initial_pose_path),
                 )
 
