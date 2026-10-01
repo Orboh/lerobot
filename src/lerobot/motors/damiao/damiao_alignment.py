@@ -153,6 +153,90 @@ def soft_move_to_position(
         time.sleep(_ALIGN_STEP_S)
 
 
+def align_through_poses(
+    bus,
+    goals: list[dict[str, float]],
+    duration_s: float = 2.2,
+    kp: dict[str, float] | None = None,
+    kd: dict[str, float] | None = None,
+    torque_ff_fn: Callable[[dict[str, float]], dict[str, float]] | None = None,
+    max_speed_dps: float | None = None,
+    blend_s: float = 0.3,
+    ramp_s: float = 0.4,
+) -> None:
+    """Move through ``goals`` (waypoints first, captured pose last) as one continuous trajectory.
+
+    Without ``max_speed_dps`` this is the previous behaviour: one ``soft_move_to_position``
+    per goal, each starting from the measured position (frozen pose sets keep their motion).
+
+    With ``max_speed_dps`` (start-pose YAML ``align: {max_speed_dps}``), the polyline
+    current-pose -> goals is replayed once: arc length in the L-inf joint metric, constant
+    speed with a ``ramp_s`` ramp at both ends only, corners rounded by a ``blend_s`` moving
+    average (deviation <= about speed * blend_s / 4 deg from the polyline). The measured
+    position is read once at the start, so a follower lagging under gravity is not pulled
+    back at every waypoint, and the arm does not stop at each waypoint (2026-10-01: per-goal
+    moves read as slow and jerky with 11 waypoints).
+    """
+    if not goals:
+        return
+    if not (max_speed_dps and max_speed_dps > 0):
+        for goal in goals:
+            soft_move_to_position(bus, goal, duration_s, kp=kp, kd=kd, torque_ff_fn=torque_ff_fn)
+        return
+    import numpy as np
+
+    kp = kp if kp is not None else OPENARM_ALIGN_KP
+    kd = kd if kd is not None else OPENARM_ALIGN_KD
+    states = bus.sync_read_all_states()
+    motors = [m for m in goals[-1] if m in bus.motors]
+    start: dict[str, float] = {}
+    for m in motors:
+        position = states.get(m, {}).get("position")
+        if position is None:
+            raise RuntimeError(
+                f"align_through_poses: motor {m!r} has no reported position after connect; "
+                "refusing to command it from an unknown pose (check CAN wiring / motor power)."
+            )
+        start[m] = position
+    pts = np.array([[start[m] for m in motors]] + [[g.get(m, goals[-1][m]) for m in motors] for g in goals])
+    seg = np.abs(np.diff(pts, axis=0)).max(axis=1)
+    cum = np.concatenate([[0.0], np.cumsum(seg)])
+    total = float(cum[-1])
+    cruise = total / max_speed_dps
+    ramp = min(ramp_s, max(cruise, _ALIGN_STEP_S))
+    t_total = max(cruise + ramp, 0.3)
+    n = max(1, round(t_total / _ALIGN_STEP_S))
+    # trapezoid speed profile in arc length: ramp up over `ramp`, cruise, ramp down over `ramp`
+    t = np.arange(1, n + 1) * (t_total / n)
+    vmax = total / max(t_total - ramp, 1e-9)
+    s = np.where(
+        t < ramp, 0.5 * vmax * t**2 / ramp,
+        np.where(t > t_total - ramp, total - 0.5 * vmax * (t_total - t) ** 2 / ramp, vmax * (t - ramp / 2)),
+    )
+    s = np.clip(s, 0.0, total)
+    traj = np.stack([np.interp(s, cum, pts[:, j]) for j in range(len(motors))], axis=1)
+    w = int(round(blend_s / _ALIGN_STEP_S))
+    if w >= 3 and len(traj) > w:
+        pad = np.concatenate([np.repeat(traj[:1], w, axis=0), traj, np.repeat(traj[-1:], w, axis=0)])
+        kernel = np.ones(w) / w
+        sm = np.stack([np.convolve(pad[:, j], kernel, mode="same") for j in range(len(motors))], axis=1)
+        traj = sm[w:-w]
+        # absorb the small end offset left by the averaging over the last `w` samples (smoothstep),
+        # instead of snapping the final sample (a 10 ms jump)
+        u = np.linspace(0.0, 1.0, w)
+        traj[-w:] += (3 * u**2 - 2 * u**3)[:, None] * (pts[-1] - traj[-1])[None, :]
+    logger.info(
+        f"Aligning {len(motors)} motors through {len(goals) - 1} waypoint(s) as one trajectory over "
+        f"{t_total:.1f}s (path {total:.0f} deg, {max_speed_dps:.0f} deg/s, blend {blend_s:.2f}s, "
+        f"gravity feed-forward {'ON' if torque_ff_fn is not None else 'off'})..."
+    )
+    for row in traj:
+        target = {m: float(v) for m, v in zip(motors, row)}
+        ff = torque_ff_fn(target) if torque_ff_fn is not None else {}
+        bus._mit_control_batch({m: (kp[m], kd[m], target[m], 0.0, float(ff.get(m, 0.0))) for m in motors})
+        time.sleep(_ALIGN_STEP_S)
+
+
 def should_rezero_on_connect(
     calibration: dict[str, MotorCalibration] | None,
     override: bool | None = None,

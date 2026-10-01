@@ -26,6 +26,7 @@ from lerobot.motors.damiao import DamiaoMotorsBus
 from lerobot.motors.damiao.damiao_alignment import (
     check_start_position,
     resolve_initial_pose,
+    align_through_poses,
     load_initial_pose_align_speed,
     resolve_initial_pose_sequence,
     should_rezero_on_connect,
@@ -211,18 +212,19 @@ class OpenArmFollower(Robot):
             # One soft move per pose: the optional ``waypoints:`` in the start-pose
             # file come first, the captured pose last. Without waypoints this is a
             # single move, identical to before.
-            for goal in resolve_initial_pose_sequence(
-                initial_pose_deg=self.config.initial_pose_deg,
-                initial_pose_path=self.config.initial_pose_path,
-                joint_limits=self.config.joint_limits,
-            ):
-                soft_move_to_position(
-                    self.bus,
-                    goal,
-                    self.config.align_duration_s,
-                    torque_ff_fn=torque_ff_fn,
-                    max_speed_dps=load_initial_pose_align_speed(self.config.initial_pose_path),
-                )
+            # With align.max_speed_dps in the YAML the sequence is replayed as one continuous
+            # trajectory; without it, one soft move per pose as before.
+            align_through_poses(
+                self.bus,
+                list(resolve_initial_pose_sequence(
+                    initial_pose_deg=self.config.initial_pose_deg,
+                    initial_pose_path=self.config.initial_pose_path,
+                    joint_limits=self.config.joint_limits,
+                )),
+                self.config.align_duration_s,
+                torque_ff_fn=torque_ff_fn,
+                max_speed_dps=load_initial_pose_align_speed(self.config.initial_pose_path),
+            )
 
         logger.info(f"{self} connected.")
 
