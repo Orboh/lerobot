@@ -25,6 +25,7 @@ from lerobot.motors.damiao import DamiaoMotorsBus
 from lerobot.motors.damiao.damiao_alignment import (
     check_start_position,
     resolve_initial_pose,
+    load_initial_pose_align_speed,
     resolve_initial_pose_sequence,
     should_rezero_on_connect,
     soft_move_to_position,
@@ -178,7 +179,11 @@ class OpenArmLeader(Teleoperator):
                     joint_limits=self._side_joint_limits(),
                 ):
                     soft_move_to_position(
-                        self.bus, goal, self.config.align_duration_s, torque_ff_fn=torque_ff_fn
+                        self.bus,
+                        goal,
+                        self.config.align_duration_s,
+                        torque_ff_fn=torque_ff_fn,
+                        max_speed_dps=load_initial_pose_align_speed(self.config.initial_pose_path),
                     )
             else:
                 logger.info("align_on_connect skipped: manual_control keeps torque disabled.")

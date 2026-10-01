@@ -89,6 +89,8 @@ def soft_move_to_position(
     kp: dict[str, float] | None = None,
     kd: dict[str, float] | None = None,
     torque_ff_fn: Callable[[dict[str, float]], dict[str, float]] | None = None,
+    max_speed_dps: float | None = None,
+    min_duration_s: float = 0.3,
 ) -> None:
     """Softly interpolate motors from their current position to ``goal_pos_deg``.
 
@@ -103,6 +105,12 @@ def soft_move_to_position(
             held (the soft gains alone sag under gravity at a lifted pose). When
             None the torque term stays 0.0 — identical to the official
             AdjustPosition and the previous behaviour.
+        max_speed_dps: when set, ``duration_s`` is replaced by the time the
+            largest joint move takes at this speed (deg/s), floored at
+            ``min_duration_s``. A fixed 2.2 s per move makes a start pose with
+            many waypoints crawl (each 1-degree hop also takes 2.2 s); sizing
+            each move by its distance keeps the peak joint speed bounded instead.
+            None keeps the fixed ``duration_s`` (the official cadence).
 
     Raises:
         RuntimeError: if a motor in ``goal_pos_deg`` has not reported a
@@ -125,6 +133,9 @@ def soft_move_to_position(
             )
         start_pos[motor] = position
 
+    if max_speed_dps and max_speed_dps > 0:
+        largest = max((abs(goal_pos_deg[m] - p) for m, p in start_pos.items()), default=0.0)
+        duration_s = max(min_duration_s, largest / max_speed_dps)
     n_steps = max(1, round(duration_s / _ALIGN_STEP_S))
     logger.info(
         f"Soft-aligning {len(start_pos)} motors to initial pose over {duration_s:.1f}s "
@@ -259,6 +270,31 @@ def load_initial_pose_file(path: str) -> dict[str, float]:
 
 
 WAYPOINTS_KEY = "waypoints"
+ALIGN_KEY = "align"
+
+
+def load_initial_pose_align_speed(path: str | None) -> float | None:
+    """Optional ``align: {max_speed_dps: <deg/s>}`` of a start-pose YAML (None when absent).
+
+    Nested on purpose: top-level scalars are read as joint values by
+    ``load_initial_pose_file``.
+    """
+    if not path:
+        return None
+    import yaml
+
+    resolved = os.path.expanduser(path)
+    if not os.path.isfile(resolved):
+        return None
+    with open(resolved) as f:
+        data = yaml.safe_load(f) or {}
+    align = data.get(ALIGN_KEY) if isinstance(data, dict) else None
+    if not isinstance(align, dict) or align.get("max_speed_dps") is None:
+        return None
+    speed = float(align["max_speed_dps"])
+    if speed <= 0:
+        raise ValueError(f"initial_pose file {resolved!r}: align.max_speed_dps must be > 0, got {speed}")
+    return speed
 
 
 def load_initial_pose_waypoints(path: str) -> list[dict[str, float]]:
