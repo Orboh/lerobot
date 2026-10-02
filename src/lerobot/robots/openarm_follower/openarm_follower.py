@@ -27,6 +27,7 @@ from lerobot.motors.damiao.damiao_alignment import (
     check_start_position,
     resolve_initial_pose,
     align_through_poses,
+    return_on_disconnect,
     load_initial_pose_align_speed,
     resolve_initial_pose_sequence,
     should_rezero_on_connect,
@@ -201,6 +202,7 @@ class OpenArmFollower(Robot):
         # set_zero_position so the pose targets use the fresh zero.
         if self.config.align_on_connect:
             torque_ff_fn = None
+            self._align_ff = None
             if self.config.align_gravity_urdf_path:
                 from lerobot.motors.damiao.openarm_gravity import OpenArmGravityModel
 
@@ -209,6 +211,7 @@ class OpenArmFollower(Robot):
                 torque_ff_fn = OpenArmGravityModel(
                     self.config.align_gravity_urdf_path, self.config.side, self.config.align_gravity_scale
                 ).torque
+                self._align_ff = torque_ff_fn
             # One soft move per pose: the optional ``waypoints:`` in the start-pose
             # file come first, the captured pose last. Without waypoints this is a
             # single move, identical to before.
@@ -494,6 +497,14 @@ class OpenArmFollower(Robot):
     @check_if_not_connected
     def disconnect(self):
         """Disconnect from robot."""
+
+        if self.config.return_on_disconnect:
+            try:
+                return_on_disconnect(
+                    self.bus, str(self), self.config.initial_pose_deg, self.config.initial_pose_path,
+                    self.config.joint_limits, self.config.align_duration_s, getattr(self, "_align_ff", None))
+            except Exception as e:  # never block the torque-off below
+                logger.warning(f"{self}: return on disconnect failed ({e}); disabling torque")
 
         # Disconnect CAN bus
         self.bus.disconnect(self.config.disable_torque_on_disconnect)

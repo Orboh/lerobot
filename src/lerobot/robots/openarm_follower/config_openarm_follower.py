@@ -138,6 +138,10 @@ class OpenArmFollowerConfigBase:
     # behaviour. Uses ``side``. Scale multiplies G(q).
     align_gravity_urdf_path: str | None = None
     align_gravity_scale: float = 1.0
+    # On exit, before torque-off: go to the start pose and replay its waypoints in reverse down to the
+    # first one (see damiao_alignment.return_on_disconnect). Off by default: Ctrl-C stays an immediate
+    # torque-off (rollout keeps it). Teleop/record scripts turn it on; a second Ctrl-C stops the return.
+    return_on_disconnect: bool = False
 
     # Startup alignment target. By default the arm aligns to the official
     # OPENARM_INITIAL_POSITION_DEG (all joints 0, elbow 36 deg). To start teleop

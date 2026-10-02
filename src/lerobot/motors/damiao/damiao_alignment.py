@@ -237,6 +237,40 @@ def align_through_poses(
         time.sleep(_ALIGN_STEP_S)
 
 
+# Set once a second Ctrl-C interrupts a return-on-disconnect move: every later return in this
+# process is skipped so the remaining arms go limp at once (Ctrl-C keeps its emergency-stop role).
+_RETURN_ABORTED = False
+
+
+def return_on_disconnect(bus, label: str, initial_pose_deg, initial_pose_path, joint_limits,
+                         duration_s: float, torque_ff_fn=None) -> None:
+    """Before torque-off on exit: go to the start pose, then replay the start-pose waypoints in reverse
+    down to the first one (the lowered pose the operator started from), so the arm does not drop
+    under gravity and does not cross the table (2026-10-02 Kento).
+
+    Only for start-pose files with waypoints and align.max_speed_dps (pose sets captured by
+    pose_from_dwell); otherwise nothing happens. A KeyboardInterrupt during the move (second Ctrl-C)
+    stops it here and marks every later return in this process as skipped; the caller then disables
+    torque as before.
+    """
+    global _RETURN_ABORTED
+    if _RETURN_ABORTED or not initial_pose_path:
+        return
+    speed = load_initial_pose_align_speed(initial_pose_path)
+    if not speed or not load_initial_pose_waypoints(initial_pose_path):
+        return
+    seq = list(resolve_initial_pose_sequence(
+        initial_pose_deg=initial_pose_deg, initial_pose_path=initial_pose_path, joint_limits=joint_limits))
+    goals = list(reversed(seq))  # start pose first, then waypoints back to the first one
+    logger.info(f"{label}: returning to the start pose and back along the waypoints before torque-off "
+                "(Ctrl-C again to stop here and go limp)")
+    try:
+        align_through_poses(bus, goals, duration_s, torque_ff_fn=torque_ff_fn, max_speed_dps=speed)
+    except KeyboardInterrupt:
+        _RETURN_ABORTED = True
+        logger.warning(f"{label}: return interrupted; disabling torque now (remaining arms skip their return)")
+
+
 def should_rezero_on_connect(
     calibration: dict[str, MotorCalibration] | None,
     override: bool | None = None,

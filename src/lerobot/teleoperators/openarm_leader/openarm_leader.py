@@ -26,6 +26,7 @@ from lerobot.motors.damiao.damiao_alignment import (
     check_start_position,
     resolve_initial_pose,
     align_through_poses,
+    return_on_disconnect,
     load_initial_pose_align_speed,
     resolve_initial_pose_sequence,
     should_rezero_on_connect,
@@ -569,5 +570,13 @@ class OpenArmLeader(Teleoperator):
         # compensation) ensure torque is disabled first, so the arm goes limp on
         # exit / Ctrl-C and is never left actively driven.
         disable = self.config.manual_control or self.config.gravity_compensation
+        if self.config.return_on_disconnect:
+            try:
+                return_on_disconnect(
+                    self.bus, str(self), self.config.initial_pose_deg, self.config.initial_pose_path,
+                    self._side_joint_limits(), self.config.align_duration_s,
+                    self._gravity_tau_from_positions if self.config.gravity_compensation else None)
+            except Exception as e:  # never block the torque-off below
+                logger.warning(f"{self}: return on disconnect failed ({e}); disabling torque")
         self.bus.disconnect(disable_torque=disable)
         logger.info(f"{self} disconnected.")

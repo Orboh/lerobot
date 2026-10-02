@@ -98,6 +98,8 @@ class OpenArmLeaderConfigBase:
     # mode; pure manual_control (torque-off) skips it.
     align_on_connect: bool = True
     align_duration_s: float = 2.2
+    # See OpenArmFollowerConfig.return_on_disconnect (same behaviour on the leader).
+    return_on_disconnect: bool = False
 
     # Startup alignment target (see OpenArmFollowerConfigBase for the full note).
     # Point initial_pose_path at a per-side YAML captured with
