@@ -240,6 +240,16 @@ def align_through_poses(
 # Set once a second Ctrl-C interrupts a return-on-disconnect move: every later return in this
 # process is skipped so the remaining arms go limp at once (Ctrl-C keeps its emergency-stop role).
 _RETURN_ABORTED = False
+# The return runs only after an explicit end (esc in teleop/record, or the session finishing by itself).
+# Ctrl-C never sets this, so Ctrl-C is always an immediate torque-off (emergency stop) — 2026-10-02 Kento:
+# keep the end command and the emergency stop on different keys.
+_RETURN_REQUESTED = False
+
+
+def request_return_on_disconnect() -> None:
+    """Call when the session ends on purpose (esc / completed); enables return_on_disconnect for this exit."""
+    global _RETURN_REQUESTED
+    _RETURN_REQUESTED = True
 
 
 def return_on_disconnect(bus, label: str, initial_pose_deg, initial_pose_path, joint_limits,
@@ -251,9 +261,12 @@ def return_on_disconnect(bus, label: str, initial_pose_deg, initial_pose_path, j
     Only for start-pose files with waypoints and align.max_speed_dps (pose sets captured by
     pose_from_dwell); otherwise nothing happens. A KeyboardInterrupt during the move (second Ctrl-C)
     stops it here and marks every later return in this process as skipped; the caller then disables
-    torque as before.
+    torque as before. Runs only after request_return_on_disconnect() (esc / normal end), never after Ctrl-C.
     """
     global _RETURN_ABORTED
+    if not _RETURN_REQUESTED:
+        logger.info(f"{label}: no end command (esc) given; disabling torque immediately")
+        return
     if _RETURN_ABORTED or not initial_pose_path:
         return
     speed = load_initial_pose_align_speed(initial_pose_path)

@@ -139,6 +139,7 @@ def teleop_loop(
     display_data: bool = False,
     duration: float | None = None,
     display_compressed_images: bool = False,
+    events: dict | None = None,
 ):
     """
     This function continuously reads actions from a teleoperation device, processes them through optional
@@ -208,6 +209,9 @@ def teleop_loop(
 
         if duration is not None and time.perf_counter() - start >= duration:
             return
+        if events is not None and events.get("stop_recording"):
+            print("\nEsc pressed: ending teleop (arms return to the start pose and back down, then go limp)")
+            return
 
 
 @parser.wrap()
@@ -229,6 +233,13 @@ def teleoperate(cfg: TeleoperateConfig):
     teleop.connect()
     robot.connect()
 
+    # esc = end on purpose (arms return along the start-pose waypoints, then torque off).
+    # Ctrl-C = immediate torque off (emergency stop). Same key reader as lerobot-record.
+    from lerobot.common.control_utils import init_keyboard_listener
+    from lerobot.motors.damiao.damiao_alignment import request_return_on_disconnect
+
+    listener, events = init_keyboard_listener()
+    print("[teleop] 終了は esc（開始姿勢から経由地を逆にたどって下ろした構えへ戻ってから脱力）。Ctrl-C は即時脱力（非常停止）")
     try:
         teleop_loop(
             teleop=teleop,
@@ -240,10 +251,14 @@ def teleoperate(cfg: TeleoperateConfig):
             robot_action_processor=robot_action_processor,
             robot_observation_processor=robot_observation_processor,
             display_compressed_images=display_compressed_images,
+            events=events,
         )
+        request_return_on_disconnect()  # esc or duration: a deliberate end
     except KeyboardInterrupt:
         pass
     finally:
+        if listener is not None:
+            listener.stop()  # restore the terminal (stdin is read raw) before anything else reads it
         if cfg.display_data:
             shutdown_rerun()
         teleop.disconnect()

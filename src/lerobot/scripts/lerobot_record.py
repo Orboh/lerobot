@@ -869,6 +869,11 @@ def record(
 
                 dataset.save_episode()
                 recorded_episodes += 1
+        # esc (stop_recording) or all episodes done: a deliberate end, so the arms may return along the
+        # start-pose waypoints before torque-off. Ctrl-C skips this line (immediate torque-off).
+        from lerobot.motors.damiao.damiao_alignment import request_return_on_disconnect
+
+        request_return_on_disconnect()
     finally:
         log_say("Stop recording", cfg.play_sounds, blocking=True)
 
