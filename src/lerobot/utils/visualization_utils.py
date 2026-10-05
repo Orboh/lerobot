@@ -30,6 +30,12 @@ from .import_utils import require_package
 # upstream behavior (full size, quality 95).
 _DISPLAY_IMAGE_SCALE = max(1, int(os.environ.get("LEROBOT_DISPLAY_IMAGE_SCALE", "1")))
 _DISPLAY_JPEG_QUALITY = min(100, max(1, int(os.environ.get("LEROBOT_DISPLAY_JPEG_QUALITY", "95"))))
+# 2026-10-05 (Orboh, Thor monitor viewer): images are already logged static (latest frame only), but
+# every joint value is logged as a time series (~40 series at 30 Hz) whose history keeps growing; the
+# resident viewer re-plotted the whole history each frame and saturated at 150-250% CPU within minutes
+# (2026-09-22), freezing the monitor during record. LEROBOT_DISPLAY_SCALARS=false sends images only.
+# Display-only: the dataset is untouched. Default keeps the upstream behavior (scalars are sent).
+_DISPLAY_SCALARS = os.environ.get("LEROBOT_DISPLAY_SCALARS", "true").strip().lower() not in ("0", "false", "no", "off")
 
 
 def init_rerun(
@@ -109,13 +115,16 @@ def log_rerun_data(
             key = k if str(k).startswith(OBS_PREFIX) else f"{OBS_STR}.{k}"
 
             if _is_scalar(v):
-                rr.log(key, rr.Scalars(float(v)))
+                if _DISPLAY_SCALARS:
+                    rr.log(key, rr.Scalars(float(v)))
             elif isinstance(v, np.ndarray):
                 arr = v
                 # Convert CHW -> HWC when needed
                 if arr.ndim == 3 and arr.shape[0] in (1, 3, 4) and arr.shape[-1] not in (1, 3, 4):
                     arr = np.transpose(arr, (1, 2, 0))
                 if arr.ndim == 1:
+                    if not _DISPLAY_SCALARS:
+                        continue
                     for i, vi in enumerate(arr):
                         rr.log(f"{key}_{i}", rr.Scalars(float(vi)))
                 else:
@@ -128,7 +137,7 @@ def log_rerun_data(
                     )
                     rr.log(key, entity=img_entity, static=True)
 
-    if action:
+    if action and _DISPLAY_SCALARS:
         for k, v in action.items():
             if v is None:
                 continue
