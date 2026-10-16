@@ -282,6 +282,21 @@ class OpenArmLeader(Teleoperator):
         soft_move_to_position(self.bus, goal, duration_s, torque_ff_fn=torque_ff_fn)
         return True
 
+    @check_if_not_connected
+    def read_positions(self) -> dict[str, float | None]:
+        """Joint positions as ``<motor>.pos`` (deg), read without changing the torque command.
+
+        ``get_action`` cannot be used to look at a leader that is being held in place: in
+        gravity-compensation mode it re-injects the gravity torque with zero gains, which
+        releases the position hold that ``soft_move_to`` (or the startup alignment) left
+        behind. This only sends state-refresh requests, so the hold stays as it is. A frozen
+        side reports its fixed pose, the same thing ``get_action`` would send.
+        """
+        if self._frozen_action is not None:
+            return {k: v for k, v in self._frozen_action.items() if k.endswith(".pos")}
+        states = self.bus.sync_read_all_states()
+        return {f"{motor}.pos": states.get(motor, {}).get("position") for motor in self.bus.motors}
+
     def calibrate(self) -> None:
         """
         Run calibration procedure for OpenArms leader (persistent software zero).

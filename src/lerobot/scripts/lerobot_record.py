@@ -100,6 +100,8 @@ from lerobot.cameras.reachy2_camera import Reachy2CameraConfig  # noqa: F401
 from lerobot.cameras.realsense import RealSenseCameraConfig  # noqa: F401
 from lerobot.cameras.zmq import ZMQCameraConfig  # noqa: F401
 from lerobot.common.control_utils import (
+    countdown_to_episode_start,
+    held_teleop_ready,
     init_keyboard_listener,
     is_headless,
     sanity_check_dataset_robot_compatibility,
@@ -232,10 +234,41 @@ class RecordConfig:
     #              start pose (clearing the workspace first), then the right arrow
     #              starts the next episode once the scene is restored.
     episode_advance: str = "auto"
+    # Manual advance only. Once 'a' has returned both arms and the return checked
+    # out, keep them at the start pose until the next episode starts, instead of
+    # resuming the teleop loop while the operator restores the scene. A
+    # gravity-compensated leader has no restoring stiffness on the wrist roll: left
+    # alone it rolls tens of degrees, the follower tracks it into whatever is
+    # nearby, and the stalled joint overheats. Held, the leader keeps the soft
+    # position hold its return ended in and the follower its last command; the hold
+    # ends on the first recorded frame. The first episode is held the same way,
+    # straight from the startup alignment. Assumes a teleop that the startup
+    # alignment and soft_move_to leave holding its pose (OpenArm leader), and motors
+    # that keep executing their last command while none is sent.
+    start_pose_hold: bool = False
+    # With start_pose_hold: how far the held leader may sit from the start pose, in
+    # degrees, when recording starts. The first frame commands the follower to the
+    # leader's pose in one step, so beyond this the episode does not start and the
+    # arms have to be returned again.
+    start_pose_handoff_deg: float = 15.0
+    # Manual advance only. Save the finished take as soon as 'a' has returned the
+    # arms, rather than on the right arrow that starts the next episode. The save
+    # blocks the loop for a few seconds; done here it overlaps with restoring the
+    # scene, and the right arrow only starts. A take can then be discarded (left
+    # arrow) only before 'a' is pressed.
+    save_on_return: bool = False
+    # Manual advance only. Whole seconds counted down on the console, one line and
+    # one terminal bell each, between the right arrow (or the end of the save it
+    # triggered) and the first recorded frame. 0 starts immediately, as before.
+    start_countdown_s: int = 0
 
     def __post_init__(self):
         if self.episode_advance not in ("auto", "manual"):
             raise ValueError(f"episode_advance must be 'auto' or 'manual', got {self.episode_advance!r}")
+        if self.start_countdown_s < 0:
+            raise ValueError(f"start_countdown_s must be >= 0, got {self.start_countdown_s}")
+        if self.start_pose_handoff_deg <= 0:
+            raise ValueError(f"start_pose_handoff_deg must be > 0, got {self.start_pose_handoff_deg}")
         if self.teleop is None:
             raise ValueError(
                 "A teleoperator is required for recording. "
@@ -671,6 +704,15 @@ def record(
                         "the start pose, restore the scene, then press the right arrow to start the "
                         "next episode (left arrow re-records, esc stops)."
                     )
+                    if cfg.start_pose_hold or cfg.save_on_return or cfg.start_countdown_s:
+                        logging.info(
+                            "Manual episode advance: start pose hold=%s (hand-off limit %.1fdeg), "
+                            "save on return=%s, start countdown=%ds.",
+                            cfg.start_pose_hold,
+                            cfg.start_pose_handoff_deg,
+                            cfg.save_on_return,
+                            cfg.start_countdown_s,
+                        )
                 # Record what the per-episode deviations below are measured against,
                 # so the log stands on its own once it leaves this machine.
                 _write_start_pose_reference(
@@ -712,6 +754,25 @@ def record(
                 display_data=cfg.display_data,
             )
 
+        def start_pose_hold_slice(seconds: float) -> None:
+            """Observe and display for a moment without commanding either arm.
+
+            Stands in for ``start_pose_teleop_slice`` while the arms are held at the
+            start pose: the monitor stays live for restoring the scene and the
+            follower's state keeps being read, but no action is sent and the teleop
+            is not touched (reading it through get_action would release its hold).
+            """
+            end_t = time.perf_counter() + seconds
+            while True:
+                start_t = time.perf_counter()
+                obs = robot.get_observation()
+                if cfg.display_data:
+                    log_rerun_data(observation=robot_observation_processor(obs))
+                remaining = end_t - time.perf_counter()
+                if remaining <= 0:
+                    break
+                precise_sleep(min(max(1 / cfg.dataset.fps - (time.perf_counter() - start_t), 0.0), remaining))
+
         with VideoEncodingManager(dataset):
             recorded_episodes = 0
             # Start-pose result carried over from the manual cue, logged at the top
@@ -726,6 +787,28 @@ def record(
             # gravity-comp settling/drift in that gap gets captured as data.
             # auto mode is untouched (its own no-keypress flow is unaffected).
             cue_before_next_record = cfg.episode_advance == "manual"
+            # Where the next cue picks the arms up (see wait_for_episode_cue). With
+            # start_pose_hold the first one starts held: the startup alignment has just
+            # left both arms at the start pose, and running the teleop loop while the
+            # operator sets up the first scene is where the leader wrist rolls away.
+            cue_state = "held" if cfg.start_pose_hold else "free"
+            # Both arms are held at the start pose, waiting for the first frame.
+            arms_held = False
+            # The take was already saved from inside the cue (save_on_return).
+            saved_on_return = False
+
+            def save_take_on_return() -> bool:
+                """Save the pending take while the arms are back at the start pose."""
+                nonlocal recorded_episodes, saved_on_return
+                if not dataset.has_pending_frames():
+                    return False
+                print(f"  episode {dataset.num_episodes} を保存中（腕は動かない） …", flush=True)
+                dataset.save_episode()
+                recorded_episodes += 1
+                saved_on_return = True
+                print(f"  episode {dataset.num_episodes - 1} を保存した", flush=True)
+                return True
+
             while recorded_episodes < cfg.dataset.num_episodes and not events["stop_recording"]:
                 if pending_start_pose is not None:
                     _log_start_pose_deviation(
@@ -738,7 +821,9 @@ def record(
 
                 if cue_before_next_record and start_pose:
                     cue_before_next_record = False
-                    deviation, outcome = wait_for_episode_cue(
+                    # No take is pending here (first episode, after a discard, or after a
+                    # refused hand-off), so there is nothing for the left arrow to discard.
+                    deviation, outcome, cue_state = wait_for_episode_cue(
                         robot=robot,
                         events=events,
                         target_pos=start_pose,
@@ -747,6 +832,11 @@ def record(
                         teleop_slice=start_pose_teleop_slice,
                         verify_deg=cfg.start_pose_tolerance_deg,
                         play_sounds=cfg.play_sounds,
+                        hold=cfg.start_pose_hold,
+                        hold_slice=start_pose_hold_slice,
+                        initial_state=cue_state,
+                        handoff_deg=cfg.start_pose_handoff_deg,
+                        discardable=False,
                     )
                     _log_start_pose_deviation(
                         cfg.start_pose_log_path,
@@ -757,13 +847,8 @@ def record(
                     )
                     if outcome == "stopped":
                         break
-                    if outcome == "rerecord":
-                        # Nothing has been recorded yet to discard. The left
-                        # arrow sets BOTH flags; exit_early must be cleared too
-                        # or the next record_loop exits instantly with a
-                        # zero-frame take.
-                        events["rerecord_episode"] = False
-                        events["exit_early"] = False
+                    arms_held = cue_state == "held"
+                    cue_state = "free"
 
                 if start_pose and cfg.episode_advance == "auto":
                     deviation, outcome = wait_for_start_pose(
@@ -787,9 +872,29 @@ def record(
                     if outcome == "stopped":
                         break
 
+                if cfg.episode_advance == "manual" and start_pose:
+                    # Whatever saving the right arrow triggered is done by now, so the count
+                    # is a fixed lead-in to the first frame. Held arms stay held through it.
+                    if not countdown_to_episode_start(
+                        events,
+                        cfg.start_countdown_s,
+                        start_pose_hold_slice if arms_held else start_pose_teleop_slice,
+                    ):
+                        break
+                    if arms_held and not held_teleop_ready(teleop, verify_pose, cfg.start_pose_handoff_deg):
+                        # The operator's grip moved the leader during the count. Recording
+                        # from here would step the follower to it; go back and wait for 'a'.
+                        arms_held = False
+                        cue_state = "blocked"
+                        cue_before_next_record = True
+                        continue
+                    arms_held = False
+
+                saved_on_return = False
                 log_say(f"Recording episode {dataset.num_episodes}", cfg.play_sounds)
                 _banner(
-                    f"録画中 episode {dataset.num_episodes}（{cfg.dataset.episode_time_s:.0f} 秒で自動終了）",
+                    ("\a" if cfg.episode_advance == "manual" and cfg.start_countdown_s > 0 else "")
+                    + f"録画中 episode {dataset.num_episodes}（{cfg.dataset.episode_time_s:.0f} 秒で自動終了）",
                     "→ 終了（テイクは保留）   ← 破棄して終了   esc 終了   a は予約（終了直後に戻す）",
                 )
                 record_loop(
@@ -814,7 +919,7 @@ def record(
                     # the right arrow starts the next episode. Skipped after the
                     # final episode, where there is no next one to set up.
                     if not events["stop_recording"] and (not is_last_episode or events["rerecord_episode"]):
-                        pending_start_pose = wait_for_episode_cue(
+                        deviation, outcome, cue_state = wait_for_episode_cue(
                             robot=robot,
                             events=events,
                             target_pos=start_pose,
@@ -823,17 +928,24 @@ def record(
                             teleop_slice=start_pose_teleop_slice,
                             verify_deg=cfg.start_pose_tolerance_deg,
                             play_sounds=cfg.play_sounds,
+                            hold=cfg.start_pose_hold,
+                            hold_slice=start_pose_hold_slice,
+                            handoff_deg=cfg.start_pose_handoff_deg,
+                            on_returned=save_take_on_return if cfg.save_on_return else None,
                         )
-                        if pending_start_pose[1] == "stopped":
+                        if outcome == "stopped":
                             # Fall through so the episode just recorded is still
                             # saved; the while condition ends the run.
-                            pending_start_pose = None
-                        elif pending_start_pose[1] == "rerecord":
-                            # The handler below discards the take. The arm still
-                            # has to be returned before the retake, so ask for the
-                            # cue again at the top of the loop.
-                            pending_start_pose = None
+                            pass
+                        elif outcome == "rerecord":
+                            # The handler below discards the take. The cue for the retake
+                            # runs at the top of the loop, from wherever this one left the
+                            # arms (cue_state): returned and held, or still to be returned.
                             cue_before_next_record = True
+                        else:
+                            pending_start_pose = (deviation, outcome)
+                            arms_held = cue_state == "held"
+                            cue_state = "free"
                 # Execute a few seconds without recording to give time to manually reset the environment
                 # Skip reset for the last episode to be recorded
                 elif not events["stop_recording"] and (not is_last_episode or events["rerecord_episode"]):
@@ -851,6 +963,13 @@ def record(
                         single_task=cfg.dataset.single_task,
                         display_data=cfg.display_data,
                     )
+
+                if saved_on_return:
+                    # Already on disk: a discard request arriving this late has nothing
+                    # left to act on, and must not leak into the next take.
+                    saved_on_return = False
+                    events["rerecord_episode"] = False
+                    continue
 
                 if events["rerecord_episode"]:
                     log_say("Re-record episode", cfg.play_sounds)

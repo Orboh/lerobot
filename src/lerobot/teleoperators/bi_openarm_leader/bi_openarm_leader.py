@@ -184,6 +184,17 @@ class BiOpenArmLeader(Teleoperator):
             ok = self.right_arm.soft_move_to(right_pose, duration_s) and ok
         return ok
 
+    @check_if_not_connected
+    def read_positions(self) -> dict[str, float | None]:
+        """Both leaders' joint positions (``left_<motor>.pos`` / ``right_<motor>.pos``), read
+        without changing either arm's torque command. See ``OpenArmLeader.read_positions``."""
+        left = self.left_arm.read_positions()
+        right = self.right_arm.read_positions()
+        return {
+            **{f"left_{k}": v for k, v in left.items()},
+            **{f"right_{k}": v for k, v in right.items()},
+        }
+
     def setup_motors(self) -> None:
         raise NotImplementedError(
             "Motor ID configuration is typically done via manufacturer tools for CAN motors."

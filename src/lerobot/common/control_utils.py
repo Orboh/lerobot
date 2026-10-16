@@ -18,8 +18,10 @@ from __future__ import annotations
 # Utilities
 ########################################################################################
 import logging
+import math
 import time
 import traceback
+from collections.abc import Callable
 from contextlib import nullcontext
 from copy import copy
 from functools import cache
@@ -204,7 +206,10 @@ def _init_stdin_key_listener(events):
                         continue
                     seq = b"\x1b"
                     # Grab the rest of an escape sequence if it arrived in the same burst.
-                    more, _, _ = select.select([fd], [], [], 0.02)
+                    # Over ssh the ESC byte and the rest of an arrow sequence ([C etc.) can arrive in
+                    # separate packets more than 20 ms apart, and the arrow was then silently dropped.
+                    # 100 ms covers that; a bare ESC (stop) is only confirmed 100 ms later.
+                    more, _, _ = select.select([fd], [], [], 0.10)
                     if more:
                         seq += os.read(fd, 8)
                     action = _decode_control_key(seq)
@@ -660,6 +665,82 @@ def drive_to_start_pose(robot, teleop, target_pos: dict) -> bool:
     return True
 
 
+def teleop_pose_deviation(teleop, target_pos: dict) -> dict[str, float]:
+    """Per-joint deviation (deg) of the teleop itself from ``target_pos``, read without releasing it.
+
+    While the arms are held at the start pose the leader is decoupled from the follower, so the
+    follower's own deviation says nothing about where the leader is. ``get_action()`` cannot be
+    used to look: on a gravity-compensated leader it re-injects the gravity torque with zero
+    gains, which is exactly what ends the hold. Teleops that can report their joints with a
+    torque-neutral read expose ``read_positions()``; for any other teleop this returns ``{}``
+    and the caller has nothing to judge on.
+    """
+    read = getattr(teleop, "read_positions", None)
+    if read is None:
+        return {}
+    return start_pose_deviation(read(), target_pos)
+
+
+def held_teleop_ready(teleop, checked_pos: dict, max_deg: float) -> bool:
+    """Whether a held teleop is close enough to the start pose to hand the follower back to it.
+
+    The follower stays at the start pose for as long as the arms are held, whatever happens to
+    the leader. The first tracking cycle of the next episode then commands the follower to the
+    leader's pose in a single step, and nothing rate-limits that path unless
+    ``max_relative_target`` is set. A leader that was pushed away, or that lost its hold, has to
+    be returned before recording starts.
+    """
+    deviation = teleop_pose_deviation(teleop, checked_pos)
+    if not deviation:
+        return True
+    worst = max(deviation, key=deviation.get)
+    logging.info(
+        "Start pose hand-off: leader worst %s=%.1fdeg (limit %.1fdeg).", worst, deviation[worst], max_deg
+    )
+    if deviation[worst] <= max_deg:
+        return True
+    logging.warning(
+        "Start pose hand-off refused: the leader is off the start pose (worst %s=%.1fdeg > %.1fdeg). "
+        "Press 'a' to return both arms again.",
+        worst,
+        deviation[worst],
+        max_deg,
+    )
+    return False
+
+
+def countdown_to_episode_start(events: dict, seconds: int, run_slice=None) -> bool:
+    """Count down on the console before the first recorded frame. Returns False when esc was pressed.
+
+    Without it the right arrow gave no usable cue: recording began the moment the previous take
+    finished saving, a few seconds later and with only a banner to say so. One line and one
+    terminal bell per second give the operator a fixed lead-in to get both hands onto the leader.
+
+    ``run_slice(seconds)`` is what runs during each second of the count: the teleop loop when the
+    follower should keep tracking the leader, or an observe-only loop while the arms are held at
+    the start pose, where they have to stay put until the first frame. None just waits. Keys
+    other than esc pressed during the count are dropped: a second right arrow would otherwise end
+    the episode on its first frame.
+    """
+    if seconds <= 0:
+        return not events.get("stop_recording")
+    for remaining in range(math.ceil(seconds), 0, -1):
+        if events.get("stop_recording"):
+            return False
+        print(f"\a  録画開始まで {remaining} …", flush=True)
+        if run_slice is not None:
+            run_slice(1.0)
+        else:
+            deadline = time.perf_counter() + 1.0
+            while time.perf_counter() < deadline and not events.get("stop_recording"):
+                time.sleep(0.05)
+    if events.get("stop_recording"):
+        return False
+    for key in ("exit_early", "rerecord_episode", "align_start_pose"):
+        events[key] = False
+    return True
+
+
 def wait_for_episode_cue(
     robot,
     events: dict,
@@ -671,7 +752,14 @@ def wait_for_episode_cue(
     slice_s: float = 2.0,
     reprompt_s: float = 15.0,
     play_sounds: bool = True,
-) -> tuple[dict[str, float], str]:
+    hold: bool = False,
+    initial_state: str = "free",
+    handoff_deg: float | None = None,
+    discardable: bool = True,
+    on_returned: Callable[[], bool] | None = None,
+    hold_slice: Callable[[float], None] | None = None,
+    hold_watch_s: float = 1.0,
+) -> tuple[dict[str, float], str, str]:
     """Hand control of the episode boundary to the operator (manual advance).
 
     Implements the collection flow:
@@ -704,11 +792,41 @@ def wait_for_episode_cue(
     which depends on what was grasped) from the check without excluding them from
     the return itself.
 
-    Returns ``(deviation, outcome)`` with outcome one of ``"started"`` (returned,
-    verified, then started), ``"started_unhomed"`` (started without a verified
-    return), ``"rerecord"`` (left arrow), or ``"stopped"`` (esc).
+    With ``hold``, a verified return stops the teleop loop instead of resuming it:
+    the leader keeps the soft position hold its return ended in, the follower keeps
+    its last command, and both stay at the start pose until the caller records the
+    first frame. A gravity-compensated leader has no restoring stiffness on the
+    wrist roll; left to the teleop loop it rolls tens of degrees while the scene is
+    being restored, the follower tracks it into whatever is nearby, and the stalled
+    joint overheats. While held, both arms are only read (every ``hold_watch_s``),
+    which keeps their feedback on the bus and the per-bus drop warnings alive, and
+    ``hold_slice`` stands in for ``teleop_slice`` so the caller can keep observing
+    (and displaying) without commanding anything.
+
+    The wait is in one of three states, returned so the next call can pick up
+    where this one left the arms (``initial_state``):
+
+    - ``"free"``: the teleop loop runs (before 'a', or without ``hold``).
+    - ``"held"``: returned and held at the start pose.
+    - ``"blocked"``: held, but the leader is more than ``handoff_deg`` off the
+      start pose. Releasing it would step the follower to the leader's pose, so
+      the right arrow is refused until 'a' has returned the arms.
+
+    ``on_returned`` runs once after the first verified return and reports whether
+    it committed the pending take (the caller saves it there, so the save overlaps
+    with restoring the scene instead of delaying the start). A committed take can
+    no longer be discarded, and neither can anything when ``discardable`` is False
+    (no take is pending): the left arrow is then dropped instead of being passed
+    on, where it used to fall through into starting a recording.
+
+    Returns ``(deviation, outcome, state)`` with outcome one of ``"started"``
+    (returned, verified, then started), ``"started_unhomed"`` (started without a
+    verified return), ``"rerecord"`` (left arrow), or ``"stopped"`` (esc).
     """
     from lerobot.utils.utils import log_say
+
+    if initial_state not in ("free", "held", "blocked"):
+        raise ValueError(f"initial_state must be 'free', 'held' or 'blocked', got {initial_state!r}")
 
     checked = verify_pos if verify_pos is not None else target_pos
 
@@ -717,18 +835,42 @@ def wait_for_episode_cue(
         current = {k: v for k, v in obs.items() if k.endswith(".pos")}
         return start_pose_deviation(current, checked)
 
-    homed = False
+    # ``paused``: the teleop loop is not run, so neither arm receives a new command.
+    paused = hold and initial_state != "free"
+    homed = hold and initial_state == "held"
+    committed = False
     prompted_at: float | None = None
     prompted_state: str | None = None
+    watched_at = 0.0
+    warned_at: float | None = None
+
+    def current_state() -> str:
+        if paused:
+            return "held" if homed else "blocked"
+        return "free"
 
     while True:
         if events.get("stop_recording"):
-            return measure(), "stopped"
+            return measure(), "stopped", current_state()
 
         if events.get("rerecord_episode"):
-            # Left arrow: the caller discards the episode just recorded. Leave the
-            # flag set so the existing rerecord handling runs unchanged.
-            return measure(), "rerecord"
+            if discardable and not committed:
+                # Left arrow: the caller discards the episode just recorded. Leave the
+                # flag set so the existing rerecord handling runs unchanged.
+                return measure(), "rerecord", current_state()
+            # Left arrow also sets exit_early; left set, it would start the episode.
+            events["rerecord_episode"] = False
+            events["exit_early"] = False
+            logging.info(
+                "Left arrow ignored: %s.",
+                "the take is already saved" if committed else "no take is pending",
+            )
+            _banner(
+                "破棄できるテイクが無い（" + ("直前のテイクは保存済み" if committed else "録画前") + "）",
+                "← は無視した",
+            )
+            prompted_at = None
+            continue
 
         if events.get("align_start_pose"):
             events["align_start_pose"] = False
@@ -746,23 +888,41 @@ def wait_for_episode_cue(
                     deviation[worst],
                     verify_deg,
                 )
+                # Not held either: a follower stopped short is pressing on something, and
+                # the teleop loop is how the operator moves it clear.
                 homed = False
+                paused = False
                 _banner(
                     f"戻し損ね: {worst} が {deviation[worst]:.1f}° ずれている（録画していない）",
                     "a もう一度戻す   → ここから録画を強行   esc 終了",
                 )
+                prompted_state = "needs_home"
             elif moved or worst is None:
                 homed = True
+                # Only a teleop that was actually driven is left holding its pose.
+                paused = hold and moved
                 log_say("Arm returned. Restore the scene, then press the right arrow", play_sounds)
+                if on_returned is not None and not committed:
+                    committed = bool(on_returned())
+                prompted_state = None
             prompted_at = time.perf_counter()
-            prompted_state = "homed" if homed else "needs_home"
             continue
 
         if events.get("exit_early"):
             events["exit_early"] = False
+            if (
+                paused
+                and homed
+                and handoff_deg is not None
+                and not held_teleop_ready(teleop, checked, handoff_deg)
+            ):
+                homed = False
+            if paused and not homed:
+                prompted_at = None
+                continue
             deviation = measure()
             if homed:
-                return deviation, "started"
+                return deviation, "started", current_state()
             worst = max(deviation, key=deviation.get) if deviation else None
             if worst is not None:
                 logging.warning(
@@ -770,11 +930,15 @@ def wait_for_episode_cue(
                     worst,
                     deviation[worst],
                 )
-            return deviation, "started_unhomed"
+            return deviation, "started_unhomed", current_state()
 
-        state = "homed" if homed else "needs_home"
+        state = current_state()
+        if state == "free":
+            state = "homed" if homed else "needs_home"
         now = time.perf_counter()
         if prompted_state != state or prompted_at is None or now - prompted_at >= reprompt_s:
+            discard_key = "   ← 直前のテイクを破棄" if discardable and not committed else ""
+            saved_note = "（前のテイクは保存済み）" if committed else ""
             if state == "needs_home":
                 if prompted_state != state:
                     log_say("Press A to return the arm to the start pose", play_sounds)
@@ -784,7 +948,25 @@ def wait_for_episode_cue(
                 )
                 _banner(
                     "待機中（録画していない）",
-                    "→ 開始   a 両腕を開始姿勢へ戻す（手を引く）   ← 直前のテイクを破棄   esc 終了",
+                    f"→ 開始   a 両腕を開始姿勢へ戻す（手を引く）{discard_key}   esc 終了",
+                )
+            elif state == "blocked":
+                logging.info(
+                    "Waiting: the leader is off the start pose while held. Press 'a' to return both arms "
+                    "(esc stops)."
+                )
+                _banner(
+                    "保持中: leader が開始姿勢からずれている（録画していない・→ は効かない）",
+                    "a もう一度戻す（手を引く）   esc 終了",
+                )
+            elif state == "held":
+                logging.info(
+                    "Waiting: both arms are held at the start pose. Restore the scene, then press the "
+                    "right arrow to start ('a' returns them again, esc stops)."
+                )
+                _banner(
+                    f"待機中: 両腕を開始姿勢で保持している（録画していない）{saved_note}",
+                    f"シーンを整えて → で開始   a もう一度戻す{discard_key}   esc 終了",
                 )
             else:
                 logging.info(
@@ -792,13 +974,41 @@ def wait_for_episode_cue(
                     "to start ('a' returns it again, esc stops)."
                 )
                 _banner(
-                    "待機中: 腕は開始姿勢に戻っている（録画していない）",
-                    "シーンを整えて → で開始（前のテイクが確定保存）   a もう一度戻す   esc 終了",
+                    f"待機中: 腕は開始姿勢に戻っている（録画していない）{saved_note}",
+                    "シーンを整えて → で開始"
+                    + ("" if committed else "（前のテイクが確定保存）")
+                    + "   a もう一度戻す   esc 終了",
                 )
             prompted_at = now
             prompted_state = state
 
-        if teleop_slice is not None:
+        if paused:
+            if now - watched_at >= hold_watch_s:
+                watched_at = now
+                # Read both arms without commanding either. A follower that has left the start
+                # pose is being pushed by something; a leader that has left it lost its hold.
+                off = []
+                follower_dev = measure()
+                if follower_dev and verify_deg is not None:
+                    worst = max(follower_dev, key=follower_dev.get)
+                    if follower_dev[worst] > verify_deg:
+                        off.append(f"follower {worst}={follower_dev[worst]:.1f}deg")
+                leader_dev = teleop_pose_deviation(teleop, checked)
+                if leader_dev and handoff_deg is not None:
+                    worst = max(leader_dev, key=leader_dev.get)
+                    if leader_dev[worst] > handoff_deg:
+                        off.append(f"leader {worst}={leader_dev[worst]:.1f}deg")
+                if homed and off and (warned_at is None or now - warned_at >= 10.0):
+                    warned_at = now
+                    logging.warning(
+                        "Start pose hold: %s off the start pose. Press 'a' to return both arms again.",
+                        ", ".join(off),
+                    )
+            if hold_slice is not None:
+                hold_slice(0.1)
+            else:
+                time.sleep(0.05)
+        elif teleop_slice is not None:
             teleop_slice(slice_s)
         else:
             time.sleep(min(slice_s, 0.5))
