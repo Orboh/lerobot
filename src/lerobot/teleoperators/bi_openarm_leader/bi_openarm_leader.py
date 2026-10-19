@@ -77,6 +77,11 @@ class BiOpenArmLeader(Teleoperator):
             bump_stop_angles_deg=config.left_arm_config.bump_stop_angles_deg,
             bump_torque_thresholds_nm=config.left_arm_config.bump_torque_thresholds_nm,
             bump_velocity_thresholds_deg_s=config.left_arm_config.bump_velocity_thresholds_deg_s,
+            bilateral_feedback=config.left_arm_config.bilateral_feedback,
+            bilateral_kp=config.left_arm_config.bilateral_kp,
+            bilateral_kd=config.left_arm_config.bilateral_kd,
+            bilateral_gripper_kp=config.left_arm_config.bilateral_gripper_kp,
+            bilateral_gripper_kd=config.left_arm_config.bilateral_gripper_kd,
         )
 
         right_arm_config = OpenArmLeaderConfig(
@@ -110,6 +115,11 @@ class BiOpenArmLeader(Teleoperator):
             bump_stop_angles_deg=config.right_arm_config.bump_stop_angles_deg,
             bump_torque_thresholds_nm=config.right_arm_config.bump_torque_thresholds_nm,
             bump_velocity_thresholds_deg_s=config.right_arm_config.bump_velocity_thresholds_deg_s,
+            bilateral_feedback=config.right_arm_config.bilateral_feedback,
+            bilateral_kp=config.right_arm_config.bilateral_kp,
+            bilateral_kd=config.right_arm_config.bilateral_kd,
+            bilateral_gripper_kp=config.right_arm_config.bilateral_gripper_kp,
+            bilateral_gripper_kd=config.right_arm_config.bilateral_gripper_kd,
         )
 
         self.left_arm = OpenArmLeader(left_arm_config)
@@ -215,8 +225,17 @@ class BiOpenArmLeader(Teleoperator):
         return action_dict
 
     def send_feedback(self, feedback: dict[str, float]) -> None:
-        # TODO: Implement force feedback
-        raise NotImplementedError
+        """Split the follower's observation dict (``left_<motor>.pos`` /
+        ``right_<motor>.pos``) by side and forward to each arm's
+        ``OpenArmLeader.send_feedback`` (see its docstring and
+        ``bilateral_feedback`` on the config — no-op unless enabled there).
+        """
+        left = {k.removeprefix("left_"): v for k, v in feedback.items() if k.startswith("left_")}
+        right = {k.removeprefix("right_"): v for k, v in feedback.items() if k.startswith("right_")}
+        if left:
+            self.left_arm.send_feedback(left)
+        if right:
+            self.right_arm.send_feedback(right)
 
     @check_if_not_connected
     def disconnect(self) -> None:

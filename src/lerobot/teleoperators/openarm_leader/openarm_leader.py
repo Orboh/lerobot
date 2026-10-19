@@ -92,6 +92,9 @@ class OpenArmLeader(Teleoperator):
         # 凍結側（この leader は follower を駆動せず、固定姿勢を返し続ける）。connect で組む。
         self._frozen_action: dict[str, Any] | None = None
         self._grav_vidx: list[int] = []
+        # bilateral_feedback 用: send_feedback() で受け取った follower の最新関節角(deg)。
+        # 未受信のモータは弱い位置引き込みをかけない(=従来どおり重力補償のみ)。
+        self._bilateral_target: dict[str, float] = {}
         self._arm_motor_names: list[str] = []
 
     @property
@@ -505,21 +508,37 @@ class OpenArmLeader(Teleoperator):
 
     def _inject_gravity(self) -> dict[str, dict[str, Any]]:
         """Read joint positions, compute the gravity torque G(q), and inject it as a
-        pure MIT torque feed-forward (kp=kd=0). Returns the freshly-read motor states.
+        MIT command. Returns the freshly-read motor states.
 
         Mirrors the C++ loop: read q -> JntToGravity(q) -> MITParam{0,0,0,0,tau}.
+        When ``bilateral_feedback`` is enabled and a follower position has been
+        received via ``send_feedback()``, a weak position pull (``bilateral_kp/kd``,
+        or ``bilateral_gripper_kp/kd`` for the gripper) toward that position is
+        added on top of the gravity torque (kp=kd=0 otherwise, i.e. the original
+        pure-torque / free-gripper behavior).
         """
         states = self.bus.sync_read_all_states()
         pos_by_motor = {m: states.get(m, {}).get("position") for m in self._arm_motor_names}
         tau = self._gravity_tau_from_positions(pos_by_motor)
 
-        # Arm joints: pure gravity torque. Gripper: free (torque 0) so it can still
-        # be moved by hand for teleop while we read back its position.
+        # Arm joints: gravity torque, plus an optional weak pull toward the
+        # follower's position (bilateral_feedback). Gripper: same pull if
+        # enabled, otherwise free (torque 0) so it can still be moved by hand.
         commands: dict[str, tuple[float, float, float, float, float]] = {}
-        for motor in self._arm_motor_names:
-            commands[motor] = (0.0, 0.0, 0.0, 0.0, tau.get(motor, 0.0))
+        for idx, motor in enumerate(self._arm_motor_names):
+            kp = kd = target = 0.0
+            if self.config.bilateral_feedback and motor in self._bilateral_target:
+                kp = self.config.bilateral_kp[idx] if idx < len(self.config.bilateral_kp) else 0.0
+                kd = self.config.bilateral_kd[idx] if idx < len(self.config.bilateral_kd) else 0.0
+                target = self._bilateral_target[motor]
+            commands[motor] = (kp, kd, target, 0.0, tau.get(motor, 0.0))
         if "gripper" in self.bus.motors:
-            commands["gripper"] = (0.0, 0.0, 0.0, 0.0, 0.0)
+            kp = kd = target = 0.0
+            if self.config.bilateral_feedback and "gripper" in self._bilateral_target:
+                kp = self.config.bilateral_gripper_kp
+                kd = self.config.bilateral_gripper_kd
+                target = self._bilateral_target["gripper"]
+            commands["gripper"] = (kp, kd, target, 0.0, 0.0)
 
         self.bus._mit_control_batch(commands)
         return states
@@ -575,7 +594,17 @@ class OpenArmLeader(Teleoperator):
         return action_dict
 
     def send_feedback(self, feedback: dict[str, float]) -> None:
-        raise NotImplementedError("Feedback is not yet implemented for OpenArm leader.")
+        """Store the follower's reported position per arm joint and gripper for
+        the next ``_inject_gravity()`` cycle (see ``bilateral_feedback`` on the
+        config). A no-op when ``bilateral_feedback`` is off. ``feedback`` keys
+        are the follower's observation dict, i.e. ``"{motor}.pos"``.
+        """
+        if not self.config.bilateral_feedback:
+            return
+        for motor in (*self._arm_motor_names, "gripper"):
+            pos = feedback.get(f"{motor}.pos")
+            if pos is not None:
+                self._bilateral_target[motor] = pos
 
     @check_if_not_connected
     def disconnect(self) -> None:

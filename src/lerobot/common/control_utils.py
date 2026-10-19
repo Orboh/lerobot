@@ -514,7 +514,7 @@ def wait_for_start_pose(
     ``"override"`` (operator skipped it with the right arrow), ``"timeout"``, or
     ``"stopped"`` (esc).
     """
-    from lerobot.utils.utils import log_say
+    from lerobot.utils.utils import play_cue
 
     # ``target_pos`` is what the arm is driven to (every joint, gripper included);
     # ``verify_pos`` is the subset the gate judges, so a joint whose value varies
@@ -580,7 +580,7 @@ def wait_for_start_pose(
             return deviation, "override"
 
         if not announced:
-            log_say("Return the arm to the start pose", play_sounds)
+            play_cue("message", play_sounds)
             announced = True
 
         offenders = ", ".join(
@@ -823,7 +823,7 @@ def wait_for_episode_cue(
     (returned, verified, then started), ``"started_unhomed"`` (started without a
     verified return), ``"rerecord"`` (left arrow), or ``"stopped"`` (esc).
     """
-    from lerobot.utils.utils import log_say
+    from lerobot.utils.utils import play_cue
 
     if initial_state not in ("free", "held", "blocked"):
         raise ValueError(f"initial_state must be 'free', 'held' or 'blocked', got {initial_state!r}")
@@ -901,7 +901,7 @@ def wait_for_episode_cue(
                 homed = True
                 # Only a teleop that was actually driven is left holding its pose.
                 paused = hold and moved
-                log_say("Arm returned. Restore the scene, then press the right arrow", play_sounds)
+                play_cue("complete", play_sounds)
                 if on_returned is not None and not committed:
                     committed = bool(on_returned())
                 prompted_state = None
@@ -941,7 +941,7 @@ def wait_for_episode_cue(
             saved_note = "（前のテイクは保存済み）" if committed else ""
             if state == "needs_home":
                 if prompted_state != state:
-                    log_say("Press A to return the arm to the start pose", play_sounds)
+                    play_cue("message", play_sounds)
                 logging.info(
                     "Waiting: press 'a' to return both arms to the start pose, "
                     "right arrow to start without returning, left arrow to re-record, esc to stop."

@@ -172,6 +172,47 @@ class OpenArmLeaderConfigBase:
     )
     position_kd: list[float] = field(default_factory=lambda: [3.0, 3.0, 3.0, 3.0, 0.2, 0.2, 0.2, 0.2])
 
+    # --- Bilateral (force-feedback) coupling, opt-in ---------------------------
+    # 2026-10-19: approximation of the C++ reference's bilateral_step()
+    # (openarm_teleop/control/openarm_bilateral_control.cpp), ported to run
+    # inside lerobot-record's ~30Hz loop (synced to dataset.fps) instead of the
+    # C++ binary's ~500Hz dedicated real-time loop. At 30Hz with real position
+    # gains, bilateral coupling is known to feel mushy/laggy and can jitter;
+    # this is a deliberate low-stiffness approximation, not true bilateral
+    # control. requires lerobot_record.py to call teleop.send_feedback(obs)
+    # for this teleop (gated on robot/teleop name there).
+    # When True, send_feedback() stores the follower's reported position per
+    # arm joint (gripper excluded), and the gravity-injection loop adds a weak
+    # position pull toward it on top of G(q), so the operator feels resistance
+    # when the follower is blocked. START LOW on real hardware; these defaults
+    # are an untuned starting point (2026-10-19, not yet validated on arm).
+    # 2026-10-19 on-arm tuning history: [3,3,3,3,1,1,1] ran clean but was
+    # imperceptible; 10x ([30,...]) was clearly felt but too tiring to move the
+    # arm continuously (at 30Hz the normal leader/follower tracking lag itself
+    # becomes a constant drag, not just real obstruction — see the loop-rate
+    # caveat above); 5x ([15,...]) felt easier but still too tiring, especially
+    # the gripper. Settled at 2.5x ([7.5,...]) / gripper 1/4 as the next step.
+    # Re-tune further only in small steps and watch for jitter/oscillation.
+    bilateral_feedback: bool = False
+
+    # Per-ARM-joint (joint_1..7, no gripper) weak position gain toward the
+    # follower's current position. Compare to position_kp (used for strong
+    # follower tracking, ~240 for shoulder joints) — these are ~3% of that.
+    bilateral_kp: list[float] = field(
+        default_factory=lambda: [7.5, 7.5, 7.5, 7.5, 2.5, 2.5, 2.5]
+    )
+    bilateral_kd: list[float] = field(
+        default_factory=lambda: [0.25, 0.25, 0.25, 0.25, 0.125, 0.125, 0.125]
+    )
+
+    # Gripper coupling (2026-10-19 added: the C++ reference bilateral_step()
+    # couples the gripper too, which is what made grip resistance perceptible
+    # in the standalone launch_bilateral.sh test; the arm-only port above did
+    # not). Started at the J5-7 wrist joint magnitude (10.0/0.5); open/close
+    # was too tiring there, cut to 1/4.
+    bilateral_gripper_kp: float = 2.5
+    bilateral_gripper_kd: float = 0.125
+
 
 @TeleoperatorConfig.register_subclass("openarm_leader")
 @dataclass

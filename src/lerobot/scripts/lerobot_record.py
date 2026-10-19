@@ -166,7 +166,7 @@ from lerobot.utils.import_utils import register_third_party_plugins
 from lerobot.utils.robot_utils import precise_sleep
 from lerobot.utils.utils import (
     init_logging,
-    log_say,
+    play_cue,
 )
 from lerobot.utils.visualization_utils import init_rerun, log_rerun_data
 
@@ -257,6 +257,17 @@ class RecordConfig:
     # scene, and the right arrow only starts. A take can then be discarded (left
     # arrow) only before 'a' is pressed.
     save_on_return: bool = False
+    # Manual advance only. Save the finished take the instant its record_loop ends
+    # (the right arrow that STOPPED this episode, or the time limit), before the
+    # 'a'-return wait even starts — earlier than save_on_return. 2026-10-19: added
+    # so a take already on disk survives a hang/crash during the return-to-start-
+    # pose wait (this fork's CAN stack has a known USB-CAN driver D-state hang on
+    # Ctrl-C; see openarm-orboh README troubleshooting). Trade-off: the left arrow
+    # can no longer discard the take just recorded (wait_for_episode_cue is called
+    # with discardable=False) — a bad take must be removed afterwards with
+    # lerobot-edit-dataset. Takes precedence over save_on_return (which would
+    # otherwise try to save again at the verified return; harmless but redundant).
+    save_on_episode_end: bool = False
     # Manual advance only. Whole seconds counted down on the console, one line and
     # one terminal bell each, between the right arrow (or the end of the save it
     # triggered) and the first recorded frame. 0 starts immediately, as before.
@@ -485,7 +496,7 @@ def record_loop(
         # Get action from teleop
         if isinstance(teleop, Teleoperator):
             act = teleop.get_action()
-            if robot.name == "unitree_g1":
+            if robot.name == "unitree_g1" or teleop.name == "bi_openarm_leader":
                 teleop.send_feedback(obs)
 
             # Applies a pipeline to the raw teleop action, default is IdentityProcessor
@@ -752,6 +763,7 @@ def record(
                 control_time_s=seconds,
                 single_task=cfg.dataset.single_task,
                 display_data=cfg.display_data,
+                display_compressed_images=display_compressed_images,
             )
 
         def start_pose_hold_slice(seconds: float) -> None:
@@ -891,7 +903,7 @@ def record(
                     arms_held = False
 
                 saved_on_return = False
-                log_say(f"Recording episode {dataset.num_episodes}", cfg.play_sounds)
+                play_cue("camera-shutter", cfg.play_sounds)
                 _banner(
                     ("\a" if cfg.episode_advance == "manual" and cfg.start_countdown_s > 0 else "")
                     + f"録画中 episode {dataset.num_episodes}（{cfg.dataset.episode_time_s:.0f} 秒で自動終了）",
@@ -912,7 +924,18 @@ def record(
                     display_compressed_images=display_compressed_images,
                 )
 
+                # Computed from recorded_episodes BEFORE the early save below (which
+                # increments it) — must reflect the count as of this recording, not
+                # after, or this and the next episode both look "last".
                 is_last_episode = recorded_episodes >= cfg.dataset.num_episodes - 1
+
+                if cfg.episode_advance == "manual" and cfg.save_on_episode_end:
+                    # Save now, before the return-to-start-pose wait, so the take
+                    # survives a hang/crash during that wait. Sets saved_on_return,
+                    # which the end-of-iteration check below turns into a no-op
+                    # re-save / drops any stray rerecord_episode flag.
+                    save_take_on_return()
+
                 if cfg.episode_advance == "manual" and start_pose:
                     # The operator owns the boundary: 'a' returns the arms (which
                     # clears the workspace before anything is placed in it), then
@@ -931,7 +954,12 @@ def record(
                             hold=cfg.start_pose_hold,
                             hold_slice=start_pose_hold_slice,
                             handoff_deg=cfg.start_pose_handoff_deg,
-                            on_returned=save_take_on_return if cfg.save_on_return else None,
+                            on_returned=(
+                                save_take_on_return
+                                if (cfg.save_on_return and not cfg.save_on_episode_end)
+                                else None
+                            ),
+                            discardable=not cfg.save_on_episode_end,
                         )
                         if outcome == "stopped":
                             # Fall through so the episode just recorded is still
@@ -949,7 +977,7 @@ def record(
                 # Execute a few seconds without recording to give time to manually reset the environment
                 # Skip reset for the last episode to be recorded
                 elif not events["stop_recording"] and (not is_last_episode or events["rerecord_episode"]):
-                    log_say("Reset the environment", cfg.play_sounds)
+                    play_cue("message", cfg.play_sounds)
 
                     record_loop(
                         robot=robot,
@@ -962,6 +990,7 @@ def record(
                         control_time_s=cfg.dataset.reset_time_s,
                         single_task=cfg.dataset.single_task,
                         display_data=cfg.display_data,
+                        display_compressed_images=display_compressed_images,
                     )
 
                 if saved_on_return:
@@ -972,7 +1001,7 @@ def record(
                     continue
 
                 if events["rerecord_episode"]:
-                    log_say("Re-record episode", cfg.play_sounds)
+                    play_cue("dialog-warning", cfg.play_sounds)
                     events["rerecord_episode"] = False
                     events["exit_early"] = False
                     dataset.clear_episode_buffer()
@@ -994,7 +1023,7 @@ def record(
 
         request_return_on_disconnect()
     finally:
-        log_say("Stop recording", cfg.play_sounds, blocking=True)
+        play_cue("complete", cfg.play_sounds)
 
         if dataset:
             dataset.finalize()
@@ -1013,7 +1042,7 @@ def record(
             else:
                 logging.warning("No episodes saved — skipping push to hub")
 
-        log_say("Exiting", cfg.play_sounds)
+        play_cue("service-logout", cfg.play_sounds)
     return dataset
 
 

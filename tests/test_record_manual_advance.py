@@ -257,6 +257,55 @@ def test_leader_moved_during_the_count_blocks_the_start(monkeypatch, tmp_path):
     assert counts == ["start_pose_hold_slice", "start_pose_hold_slice"]
 
 
+def test_save_on_episode_end_saves_before_the_return_wait(monkeypatch, tmp_path):
+    """2026-10-19: save_on_episode_end saves the instant record_loop ends (the right
+    arrow/time limit that stopped THIS episode), before the 'a'-return wait even starts
+    — earlier than save_on_return (which saves at the verified return) and the default
+    (which saves at the right arrow that starts the NEXT episode). The take can then no
+    longer be discarded with the left arrow (wait_for_episode_cue gets discardable=False)."""
+
+    seen_waiting = []
+    seen_discard_refused = []
+
+    def operator(session, title):
+        if WAITING in title and not seen_waiting:
+            seen_waiting.append(True)
+            session.press("left")  # pre-record: nothing to discard either way
+        elif NOTHING_TO_DISCARD in title and not seen_discard_refused:
+            seen_discard_refused.append(True)
+            session.press("right")  # starts episode 0
+        elif WAITING in title and len(seen_waiting) == 1:
+            seen_waiting.append(True)
+            session.press("left")  # post-record: take is already saved, must be refused
+        elif NOTHING_TO_DISCARD in title:
+            session.press("a")
+        elif RETURNED in title:
+            session.press("right")
+
+    s = Session(monkeypatch, tmp_path, operator, save_on_episode_end=True)
+    dataset = s.run(num_episodes=2)
+
+    assert dataset.meta.total_episodes == 2
+    first_rec = s.banner_index("録画中 episode 0")
+
+    # Saved the instant episode 0's recording ends (here, the 0.2s time limit), before
+    # the post-record wait shows its first banner.
+    post_record_waiting = s.banner_index(WAITING, first_rec)
+    saved = s.index(("save", 0))
+    assert first_rec < saved < post_record_waiting
+
+    # Left arrow during the post-record wait is refused: the take is already committed.
+    discard_refused = s.banner_index(NOTHING_TO_DISCARD, post_record_waiting)
+    assert post_record_waiting < s.index(("key", "left"), post_record_waiting) < discard_refused
+
+    returned = s.banner_index(RETURNED, discard_refused)
+    second_rec = s.banner_index("録画中 episode 1", returned)
+    assert discard_refused < returned < second_rec
+
+    # Nothing saved twice, nothing lost.
+    assert [e for e in s.timeline if e[0] == "save"] == [("save", 0), ("save", 1)]
+
+
 def test_esc_while_held_keeps_the_saved_take(monkeypatch, tmp_path):
     def operator(session, title):
         if WAITING in title:

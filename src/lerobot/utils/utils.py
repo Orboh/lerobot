@@ -146,6 +146,22 @@ def log_say(text: str, play_sounds: bool = True, blocking: bool = False):
         say(text, blocking)
 
 
+_FREEDESKTOP_SOUND_DIR = "/usr/share/sounds/freedesktop/stereo"
+
+
+def play_cue(name: str, play_sounds: bool = True) -> None:
+    """Orboh fork: 録画イベントの通知音。espeak-ng の日本語音声合成は品質が低く聞き取れない
+    （2026-10-19 実機確認、「録画」等が聞き取れない音になる）ため、言語に依存しない
+    freedesktop 標準通知音（.oga）を鳴らす。文言は呼び出し側の logging/_banner に残る。
+    """
+    if not play_sounds or platform.system() != "Linux":
+        return
+    path = f"{_FREEDESKTOP_SOUND_DIR}/{name}.oga"
+    if not os.path.exists(path):
+        return
+    subprocess.Popen(["paplay", path])
+
+
 def get_channel_first_image_shape(image_shape: tuple) -> tuple:
     shape = copy(image_shape)
     if shape[2] < shape[0] and shape[2] < shape[1]:  # (h, w, c) -> (c, h, w)
