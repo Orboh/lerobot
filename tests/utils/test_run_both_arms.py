@@ -19,6 +19,7 @@ import threading
 
 import pytest
 
+from lerobot.robots.bi_openarm_follower.bi_openarm_follower import BiOpenArmFollower
 from lerobot.teleoperators.bi_openarm_leader.bi_openarm_leader import BiOpenArmLeader
 from lerobot.utils.robot_utils import run_both_arms
 
@@ -88,3 +89,60 @@ def test_leader_soft_move_to_reports_a_refusing_side_in_parallel():
     assert leader.soft_move_to({"left_joint_1": 1.0, "right_joint_1": 2.0}) is False
     assert right.poses == [{"joint_1": 2.0}]
 
+
+# 2026-10-24: every top-level camera belongs to the left follower, which used to open them
+# (about 1 s each) before its connect-time alignment, so the left arm started moving ~3 s
+# after the other three. In parallel the cameras now open while both arms align.
+
+
+class _Cam:
+    def __init__(self, barrier):
+        self.barrier = barrier
+        self.connected = False
+
+    def connect(self):
+        self.barrier.wait()
+        self.connected = True
+
+
+class _FollowerArm:
+    def __init__(self, barrier, cameras=None):
+        self.barrier = barrier
+        self.cameras = cameras or {}
+        self.calls = []
+        self.is_connected = False
+
+    def connect(self, calibrate=True, connect_cameras=True):
+        self.calls.append((calibrate, connect_cameras))
+        if connect_cameras:
+            for cam in self.cameras.values():
+                cam.connect()
+        if self.barrier is not None:
+            self.barrier.wait()
+
+
+def _follower(parallel, left, right):
+    follower = object.__new__(BiOpenArmFollower)
+    follower.config = type("Cfg", (), {"parallel_arms": parallel})()
+    follower.left_arm = left
+    follower.right_arm = right
+    return follower
+
+
+def test_follower_parallel_connect_opens_cameras_while_both_arms_align():
+    # Left arm, right arm and the camera all wait for each other: only possible if the
+    # cameras no longer hold up the left arm's alignment.
+    barrier = threading.Barrier(3, timeout=5)
+    cam = _Cam(barrier)
+    left, right = _FollowerArm(barrier, {"chest": cam}), _FollowerArm(barrier)
+    _follower(True, left, right).connect()
+    assert left.calls == right.calls == [(True, False)]
+    assert cam.connected
+
+
+def test_follower_sequential_connect_keeps_the_cameras_in_the_left_arm():
+    cam = _Cam(threading.Barrier(1))
+    left, right = _FollowerArm(None, {"chest": cam}), _FollowerArm(None)
+    _follower(False, left, right).connect()
+    assert left.calls == right.calls == [(True, True)]
+    assert cam.connected

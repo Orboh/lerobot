@@ -160,10 +160,28 @@ class BiOpenArmFollower(Robot):
 
     @check_if_already_connected
     def connect(self, calibrate: bool = True) -> None:
+        if not self.config.parallel_arms:
+            self.left_arm.connect(calibrate)
+            self.right_arm.connect(calibrate)
+            return
+
+        # All top-level cameras sit on the left arm, which would open them (about 1 s each)
+        # before aligning, so the left arm started moving ~3 s after the right one
+        # (2026-10-24). Open them alongside both arms' alignment instead.
+        cameras = [*self.left_arm.cameras.values(), *self.right_arm.cameras.values()]
+
+        def connect_cameras() -> None:
+            for cam in cameras:
+                cam.connect()
+
         run_both_arms(
-            lambda: self.left_arm.connect(calibrate),
-            lambda: self.right_arm.connect(calibrate),
-            parallel=self.config.parallel_arms,
+            lambda: run_both_arms(
+                lambda: self.left_arm.connect(calibrate, connect_cameras=False),
+                lambda: self.right_arm.connect(calibrate, connect_cameras=False),
+                parallel=True,
+            ),
+            connect_cameras,
+            parallel=True,
         )
 
     @property

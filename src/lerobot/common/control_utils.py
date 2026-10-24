@@ -617,8 +617,24 @@ def wait_for_start_pose(
             time.sleep(min(slice_s, 0.5))
 
 
+# Set once per recording session by lerobot_record (``--parallel_leader_follower``).
+_PARALLEL_LEADER_FOLLOWER = False
+
+
+def set_parallel_leader_follower(enabled: bool) -> None:
+    """Drive the leader and the follower at the same time in ``drive_to_start_pose``."""
+    global _PARALLEL_LEADER_FOLLOWER
+    _PARALLEL_LEADER_FOLLOWER = bool(enabled)
+
+
 def drive_to_start_pose(robot, teleop, target_pos: dict) -> bool:
     """Move both arms back to ``target_pos``, leader first, then follower.
+
+    With ``set_parallel_leader_follower(True)`` both are driven at the same time instead.
+    That is safe because the teleop loop is not running while this blocks, so nothing
+    makes the follower chase the leader mid-way, and both end on the same ``target_pos``.
+    It only applies to a leader that reports ``can_soft_move()``: a leader that would
+    refuse falls through to the sequential path, which then moves nothing.
 
     The order matters: while teleoperating, the leader's pose commands the
     follower, so moving the follower alone is undone by the next tracking cycle.
@@ -637,6 +653,24 @@ def drive_to_start_pose(robot, teleop, target_pos: dict) -> bool:
     if teleop is None:
         logging.warning("Start pose: no teleoperator to drive; move the arm by hand instead.")
         return False
+
+    can_soft_move = getattr(teleop, "can_soft_move", None)
+    if _PARALLEL_LEADER_FOLLOWER and hasattr(teleop, "soft_move_to") and can_soft_move and can_soft_move():
+        from lerobot.utils.robot_utils import run_both_arms
+
+        # Read before either side moves: the follower walk starts from where it is now.
+        current_pos = {k: v for k, v in robot.get_observation().items() if k in target_pos}
+        logging.info("Start pose: driving the leader and the follower back at the same time.")
+        leader_ok, _ = run_both_arms(
+            lambda: teleop.soft_move_to(
+                {k.removesuffix(".pos"): v for k, v in target_pos.items()}, duration_s=2.0
+            ),
+            lambda: follower_smooth_move_to(robot, current_pos, target_pos, duration_s=1.5)
+            if current_pos
+            else None,
+            parallel=True,
+        )
+        return bool(leader_ok)
 
     if hasattr(teleop, "soft_move_to"):
         # Teleops that drive themselves on their own bus (OpenArm leader: MIT

@@ -147,12 +147,15 @@ class OpenArmFollower(Robot):
         return self.bus.is_connected and all(cam.is_connected for cam in self.cameras.values())
 
     @check_if_already_connected
-    def connect(self, calibrate: bool = True) -> None:
+    def connect(self, calibrate: bool = True, connect_cameras: bool = True) -> None:
         """
         Connect to the robot and optionally calibrate.
 
         We assume that at connection time, the arms are in a safe rest position,
         and torque can be safely disabled to run calibration if needed.
+
+        ``connect_cameras=False`` leaves the cameras to the caller, so a bimanual robot can
+        open them while the arms align instead of before (BiOpenArmFollower, parallel_arms).
         """
 
         # Connect to CAN bus
@@ -166,8 +169,9 @@ class OpenArmFollower(Robot):
             )
             self.calibrate()
 
-        for cam in self.cameras.values():
-            cam.connect()
+        if connect_cameras:
+            for cam in self.cameras.values():
+                cam.connect()
 
         # Persistent zero: decide ONCE whether to burn a fresh motor-side zero at
         # the current pose (legacy, forces the operator to hang the arm down

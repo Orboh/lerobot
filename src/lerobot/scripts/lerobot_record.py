@@ -105,6 +105,7 @@ from lerobot.common.control_utils import (
     init_keyboard_listener,
     is_headless,
     sanity_check_dataset_robot_compatibility,
+    set_parallel_leader_follower,
     _banner,
     wait_for_episode_cue,
     wait_for_start_pose,
@@ -163,7 +164,7 @@ from lerobot.teleoperators.keyboard import KeyboardTeleop
 from lerobot.utils.constants import ACTION, OBS_STR
 from lerobot.utils.feature_utils import build_dataset_frame, combine_feature_dicts
 from lerobot.utils.import_utils import register_third_party_plugins
-from lerobot.utils.robot_utils import precise_sleep
+from lerobot.utils.robot_utils import precise_sleep, run_both_arms
 from lerobot.utils.utils import (
     init_logging,
     play_cue,
@@ -280,6 +281,11 @@ class RecordConfig:
     # one terminal bell each, between the right arrow (or the end of the save it
     # triggered) and the first recorded frame. 0 starts immediately, as before.
     start_countdown_s: int = 0
+    # 2026-10-24: drive the leader and the follower at the same time instead of one after
+    # the other — the connect-time alignment, the start-pose return between takes, and the
+    # return on disconnect. With the robot's and the teleop's own ``parallel_arms`` all four
+    # OpenArm arms move at once. Each arm is on its own CAN bus.
+    parallel_leader_follower: bool = False
 
     def __post_init__(self):
         if self.episode_advance not in ("auto", "manual"):
@@ -320,6 +326,25 @@ class RecordConfig:
                                V
                   ( Rerun Log / Loop Wait )
 """
+
+
+def _connect_devices(robot, teleop, parallel: bool) -> None:
+    """Connect the robot, then the teleop — or both at once with ``parallel``."""
+    if teleop is None:
+        robot.connect()
+        return
+    run_both_arms(robot.connect, teleop.connect, parallel=parallel)
+
+
+def _disconnect_devices(robot, teleop, parallel: bool) -> None:
+    """Disconnect whatever is still connected, robot first — or both at once with ``parallel``.
+
+    In parallel a failing side does not leave the other mid-return; the failure is raised
+    once both have finished (see ``run_both_arms``).
+    """
+    robot_job = robot.disconnect if robot.is_connected else (lambda: None)
+    teleop_job = teleop.disconnect if teleop is not None and teleop.is_connected else (lambda: None)
+    run_both_arms(robot_job, teleop_job, parallel=parallel)
 
 
 def _utc_now() -> str:
@@ -676,9 +701,8 @@ def record(
                 encoder_queue_maxsize=cfg.dataset.encoder_queue_maxsize,
             )
 
-        robot.connect()
-        if teleop is not None:
-            teleop.connect()
+        set_parallel_leader_follower(cfg.parallel_leader_follower)
+        _connect_devices(robot, teleop, parallel=cfg.parallel_leader_follower)
 
         listener, events = init_keyboard_listener()
 
@@ -1058,10 +1082,7 @@ def record(
         if dataset:
             dataset.finalize()
 
-        if robot.is_connected:
-            robot.disconnect()
-        if teleop and teleop.is_connected:
-            teleop.disconnect()
+        _disconnect_devices(robot, teleop, parallel=cfg.parallel_leader_follower)
 
         if not is_headless() and listener:
             listener.stop()

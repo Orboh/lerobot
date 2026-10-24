@@ -253,6 +253,10 @@ class OpenArmLeader(Teleoperator):
             else LEFT_DEFAULT_JOINTS_LIMITS
         )
 
+    def can_soft_move(self) -> bool:
+        """Whether ``soft_move_to`` would drive the arm (False: torque-off manual_control)."""
+        return bool(self.config.gravity_compensation or not self.config.manual_control)
+
     def soft_move_to(self, pose_deg: dict[str, float], duration_s: float = 2.0) -> bool:
         """Softly drive the leader to ``pose_deg`` on its own bus.
 
@@ -270,7 +274,7 @@ class OpenArmLeader(Teleoperator):
         Returns False when the leader is not under torque (pure manual_control),
         where driving it would leave it stiff and unusable for teleoperation.
         """
-        if not (self.config.gravity_compensation or not self.config.manual_control):
+        if not self.can_soft_move():
             logger.warning(
                 "soft_move_to: leader runs in torque-off manual_control; refusing to drive it "
                 "(enabling torque here would leave the arm stiff). Move it by hand instead."

@@ -164,6 +164,10 @@ class BiOpenArmLeader(Teleoperator):
         self.left_arm.configure()
         self.right_arm.configure()
 
+    def can_soft_move(self) -> bool:
+        """Whether ``soft_move_to`` would drive both leaders (see ``OpenArmLeader.can_soft_move``)."""
+        return self.left_arm.can_soft_move() and self.right_arm.can_soft_move()
+
     def soft_move_to(self, pose_deg: dict[str, float], duration_s: float = 2.0) -> bool:
         """Softly drive both leaders to ``pose_deg`` (keys ``left_<motor>`` / ``right_<motor>``).
 
