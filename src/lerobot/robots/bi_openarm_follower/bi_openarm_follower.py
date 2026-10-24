@@ -19,6 +19,7 @@ from functools import cached_property
 
 from lerobot.types import RobotAction, RobotObservation
 from lerobot.utils.decorators import check_if_already_connected, check_if_not_connected
+from lerobot.utils.robot_utils import run_both_arms
 
 from ..openarm_follower import OpenArmFollower, OpenArmFollowerConfig
 from ..robot import Robot
@@ -159,8 +160,11 @@ class BiOpenArmFollower(Robot):
 
     @check_if_already_connected
     def connect(self, calibrate: bool = True) -> None:
-        self.left_arm.connect(calibrate)
-        self.right_arm.connect(calibrate)
+        run_both_arms(
+            lambda: self.left_arm.connect(calibrate),
+            lambda: self.right_arm.connect(calibrate),
+            parallel=self.config.parallel_arms,
+        )
 
     @property
     def is_calibrated(self) -> bool:
@@ -226,5 +230,4 @@ class BiOpenArmFollower(Robot):
 
     @check_if_not_connected
     def disconnect(self):
-        self.left_arm.disconnect()
-        self.right_arm.disconnect()
+        run_both_arms(self.left_arm.disconnect, self.right_arm.disconnect, parallel=self.config.parallel_arms)

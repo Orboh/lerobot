@@ -268,6 +268,14 @@ class RecordConfig:
     # lerobot-edit-dataset. Takes precedence over save_on_return (which would
     # otherwise try to save again at the verified return; harmless but redundant).
     save_on_episode_end: bool = False
+    # Manual advance with a start pose only. 2026-10-21: the end of a take returns both
+    # arms by itself, so 'a' is never needed. The right arrow (or the time limit) that
+    # ends a take saves it and then returns; the left arrow during a take discards it and
+    # then returns. In both cases the next right arrow only starts the next take. The
+    # take is on disk before the return starts (as with save_on_episode_end), so a bad
+    # take must be discarded with the left arrow while it is still being recorded.
+    # Takes precedence over save_on_episode_end and save_on_return.
+    return_on_episode_end: bool = False
     # Manual advance only. Whole seconds counted down on the console, one line and
     # one terminal bell each, between the right arrow (or the end of the save it
     # triggered) and the first recorded frame. 0 starts immediately, as before.
@@ -903,11 +911,14 @@ def record(
                     arms_held = False
 
                 saved_on_return = False
+                return_on_end = cfg.episode_advance == "manual" and bool(start_pose) and cfg.return_on_episode_end
                 play_cue("camera-shutter", cfg.play_sounds)
                 _banner(
                     ("\a" if cfg.episode_advance == "manual" and cfg.start_countdown_s > 0 else "")
                     + f"録画中 episode {dataset.num_episodes}（{cfg.dataset.episode_time_s:.0f} 秒で自動終了）",
-                    "→ 終了（テイクは保留）   ← 破棄して終了   esc 終了   a は予約（終了直後に戻す）",
+                    "→ 保存して開始姿勢へ戻す   ← 破棄して開始姿勢へ戻す   esc 保存して終了"
+                    if return_on_end
+                    else "→ 終了（テイクは保留）   ← 破棄して終了   esc 終了   a は予約（終了直後に戻す）",
                 )
                 record_loop(
                     robot=robot,
@@ -923,6 +934,25 @@ def record(
                     display_data=cfg.display_data,
                     display_compressed_images=display_compressed_images,
                 )
+
+                if return_on_end:
+                    # The key that ended the take decides its fate right here; the cue at the
+                    # top of the loop then returns the arms (the align flag stands in for 'a')
+                    # and waits for the right arrow. Nothing is pending there, so a stray left
+                    # arrow is refused instead of starting a take.
+                    if events["rerecord_episode"] and not events["stop_recording"]:
+                        dataset.clear_episode_buffer()
+                        play_cue("dialog-warning", cfg.play_sounds)
+                        _banner(f"episode {dataset.num_episodes} を破棄した", "両腕を開始姿勢へ戻す（手を引く）")
+                    else:
+                        save_take_on_return()
+                    events["rerecord_episode"] = False
+                    events["exit_early"] = False
+                    saved_on_return = False
+                    if not events["stop_recording"] and recorded_episodes < cfg.dataset.num_episodes:
+                        events["align_start_pose"] = True
+                        cue_before_next_record = True
+                    continue
 
                 # Computed from recorded_episodes BEFORE the early save below (which
                 # increments it) — must reflect the count as of this recording, not

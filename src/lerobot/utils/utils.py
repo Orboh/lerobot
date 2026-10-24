@@ -159,7 +159,10 @@ def play_cue(name: str, play_sounds: bool = True) -> None:
     path = f"{_FREEDESKTOP_SOUND_DIR}/{name}.oga"
     if not os.path.exists(path):
         return
-    subprocess.Popen(["paplay", path])
+    # 2026-10-21: 録画開始のシャッター音が小さく聞き逃す。LEROBOT_SHUTTER_GAIN 倍（1.0 = 従来）で鳴らす。
+    # paplay の --volume は線形で 65536 = 100%。それを超えると増幅になる（大きすぎると音が割れる）。
+    gain = float(os.environ.get("LEROBOT_SHUTTER_GAIN", "1.0")) if name == "camera-shutter" else 1.0
+    subprocess.Popen(["paplay", f"--volume={int(65536 * gain)}", path])
 
 
 def get_channel_first_image_shape(image_shape: tuple) -> tuple:

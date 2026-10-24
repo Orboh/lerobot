@@ -53,3 +53,22 @@ def precise_sleep(seconds: float, spin_threshold: float = 0.010, sleep_margin: f
     else:
         # On Linux time.sleep is accurate enough for most uses
         time.sleep(seconds)
+
+
+def run_both_arms(left, right, parallel: bool = False) -> tuple:
+    """Run ``left()`` and ``right()`` and return ``(left_result, right_result)``.
+
+    Sequential (left, then right) by default. With ``parallel`` both run at once in two
+    threads — for bimanual arms on separate buses, where connect-time alignment and the
+    start-pose return otherwise take twice as long. Both sides always run to the end
+    (a failing side never leaves the other mid-motion); the first failure, left before
+    right, is then raised.
+    """
+    if not parallel:
+        return left(), right()
+
+    from concurrent.futures import ThreadPoolExecutor
+
+    with ThreadPoolExecutor(max_workers=2, thread_name_prefix="arm") as pool:
+        futures = (pool.submit(left), pool.submit(right))
+    return tuple(f.result() for f in futures)

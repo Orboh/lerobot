@@ -19,6 +19,7 @@ from functools import cached_property
 
 from lerobot.types import RobotAction
 from lerobot.utils.decorators import check_if_already_connected, check_if_not_connected
+from lerobot.utils.robot_utils import run_both_arms
 
 from ..openarm_leader import OpenArmLeader, OpenArmLeaderConfig
 from ..teleoperator import Teleoperator
@@ -145,8 +146,11 @@ class BiOpenArmLeader(Teleoperator):
 
     @check_if_already_connected
     def connect(self, calibrate: bool = True) -> None:
-        self.left_arm.connect(calibrate)
-        self.right_arm.connect(calibrate)
+        run_both_arms(
+            lambda: self.left_arm.connect(calibrate),
+            lambda: self.right_arm.connect(calibrate),
+            parallel=self.config.parallel_arms,
+        )
 
     @property
     def is_calibrated(self) -> bool:
@@ -164,7 +168,8 @@ class BiOpenArmLeader(Teleoperator):
         """Softly drive both leaders to ``pose_deg`` (keys ``left_<motor>`` / ``right_<motor>``).
 
         Splits the pose by side prefix and calls each arm's ``OpenArmLeader.soft_move_to``
-        in turn (left first, then right — the same order as ``connect``). Exists because
+        in turn (left first, then right — the same order as ``connect``), or both at once with
+        ``parallel_arms``. Exists because
         the record start-pose return (``drive_to_start_pose`` in lerobot.common.control_utils)
         looks for ``soft_move_to`` on the teleop and passes the robot's ``.pos`` keys with
         the suffix stripped, i.e. ``right_joint_1`` ... ``left_gripper``; without this method
@@ -187,12 +192,12 @@ class BiOpenArmLeader(Teleoperator):
         if not left_pose and not right_pose:
             logger.warning("soft_move_to: no left_/right_ keys in pose; nothing to drive.")
             return False
-        ok = True
-        if left_pose:
-            ok = self.left_arm.soft_move_to(left_pose, duration_s) and ok
-        if right_pose:
-            ok = self.right_arm.soft_move_to(right_pose, duration_s) and ok
-        return ok
+        left_ok, right_ok = run_both_arms(
+            lambda: self.left_arm.soft_move_to(left_pose, duration_s) if left_pose else True,
+            lambda: self.right_arm.soft_move_to(right_pose, duration_s) if right_pose else True,
+            parallel=self.config.parallel_arms,
+        )
+        return bool(left_ok and right_ok)
 
     @check_if_not_connected
     def read_positions(self) -> dict[str, float | None]:
@@ -239,5 +244,4 @@ class BiOpenArmLeader(Teleoperator):
 
     @check_if_not_connected
     def disconnect(self) -> None:
-        self.left_arm.disconnect()
-        self.right_arm.disconnect()
+        run_both_arms(self.left_arm.disconnect, self.right_arm.disconnect, parallel=self.config.parallel_arms)

@@ -27,3 +27,7 @@ class BiOpenArmLeaderConfig(TeleoperatorConfig):
 
     left_arm_config: OpenArmLeaderConfigBase
     right_arm_config: OpenArmLeaderConfigBase
+
+    # 2026-10-21: connect, disconnect and soft_move_to (the start-pose return) drive the
+    # left and right leaders at the same time instead of left, then right. Off by default.
+    parallel_arms: bool = False

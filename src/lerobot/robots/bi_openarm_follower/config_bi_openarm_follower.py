@@ -34,3 +34,8 @@ class BiOpenArmFollowerConfig(RobotConfig):
 
     # Top-level cameras shared across both arms.
     cameras: dict[str, CameraConfig] = field(default_factory=dict)
+
+    # 2026-10-21: connect (with its start-pose alignment) and disconnect (with its return)
+    # drive the left and right arms at the same time instead of left, then right. Each arm
+    # is on its own CAN bus. Off by default: the arms' paths are not checked against each other.
+    parallel_arms: bool = False

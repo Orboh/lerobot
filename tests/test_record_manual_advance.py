@@ -306,6 +306,71 @@ def test_save_on_episode_end_saves_before_the_return_wait(monkeypatch, tmp_path)
     assert [e for e in s.timeline if e[0] == "save"] == [("save", 0), ("save", 1)]
 
 
+def press_after_frames(monkeypatch, session, n, key):
+    """Press ``key`` once, after the ``n``-th frame of the first take (mid-recording)."""
+    add_frame = LeRobotDataset.add_frame
+    frames = []
+
+    def traced_add_frame(dataset, *args, **kwargs):
+        out = add_frame(dataset, *args, **kwargs)
+        frames.append(True)
+        if len(frames) == n:
+            session.press(key)
+        return out
+
+    monkeypatch.setattr(LeRobotDataset, "add_frame", traced_add_frame)
+
+
+def test_return_on_episode_end_saves_and_returns_without_a(monkeypatch, tmp_path):
+    """2026-10-21: the right arrow that ends a take saves it and drives both arms back to
+    the start pose by itself; the next right arrow only starts. 'a' is never needed."""
+
+    def operator(session, title):
+        if HELD in title:
+            session.press("right")
+
+    s = Session(monkeypatch, tmp_path, operator, start_pose_hold=True, return_on_episode_end=True)
+    dataset = s.run(num_episodes=2)
+
+    assert dataset.meta.total_episodes == 2
+    first_rec = s.banner_index("録画中 episode 0")
+    saved = s.index(("save", 0), first_rec)
+    leader_move = s.index(("leader_move",), saved)
+    held_again = s.banner_index(HELD, leader_move)
+    second_rec = s.banner_index("録画中 episode 1", held_again)
+    # Saved first, then returned, then held until the right arrow starts the next take.
+    assert first_rec < saved < leader_move < held_again < second_rec
+    assert s.count("get_action", leader_move, second_rec) == 0
+    assert ("key", "a") not in s.timeline
+    assert [e for e in s.timeline if e[0] == "save"] == [("save", 0), ("save", 1)]
+
+
+def test_return_on_episode_end_left_arrow_discards_and_returns(monkeypatch, tmp_path):
+    """The left arrow during a take discards it and returns the arms in one go; after the
+    return the right arrow records the retake under the same episode index."""
+
+    def operator(session, title):
+        if HELD in title:
+            session.press("right")
+
+    s = Session(monkeypatch, tmp_path, operator, start_pose_hold=True, return_on_episode_end=True)
+    press_after_frames(monkeypatch, s, 2, "left")
+    dataset = s.run(num_episodes=1)
+
+    assert dataset.meta.total_episodes == 1
+    first_rec = s.banner_index("録画中 episode 0")
+    left = s.index(("key", "left"), first_rec)
+    discarded = s.banner_index("を破棄した", left)
+    leader_move = s.index(("leader_move",), discarded)
+    held_again = s.banner_index(HELD, leader_move)
+    retake = s.banner_index("録画中 episode 0", held_again)
+    assert first_rec < left < discarded < leader_move < held_again < retake
+    # The discarded take was never written; only the retake was.
+    assert s.count("save", 0, retake) == 0
+    assert [e for e in s.timeline if e[0] == "save"] == [("save", 0)]
+    assert ("key", "a") not in s.timeline
+
+
 def test_esc_while_held_keeps_the_saved_take(monkeypatch, tmp_path):
     def operator(session, title):
         if WAITING in title:
